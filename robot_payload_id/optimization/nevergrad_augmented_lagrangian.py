@@ -161,6 +161,43 @@ class NevergradAugmentedLagrangian:
         # terms for each suggested x value.
         x_suggests: List[np.ndarray] = []
         cached_results: List[Tuple[float, np.ndarray, float]] = []
+        num_candidate_evaluations = 0
+
+        def safe_float(value: float) -> Optional[float]:
+            value = float(value)
+            return value if np.isfinite(value) else None
+
+        def log_nevergrad_progress(
+            losses: List[float],
+            constraint_residues: List[np.ndarray],
+            cost_function_values: List[float],
+        ) -> None:
+            if wandb.run is None:
+                return
+
+            loss_arr = np.asarray(losses, dtype=float)
+            cost_arr = np.asarray(cost_function_values, dtype=float)
+            residue_norms = np.asarray(
+                [np.linalg.norm(residue) for residue in constraint_residues],
+                dtype=float,
+            )
+            payload = {
+                "Nevergrad candidate evaluations": num_candidate_evaluations,
+                "Nevergrad batch min loss": safe_float(np.nanmin(loss_arr)),
+                "Nevergrad batch mean loss": safe_float(np.nanmean(loss_arr)),
+                "Nevergrad batch min cost": safe_float(np.nanmin(cost_arr)),
+                "Nevergrad batch mean cost": safe_float(np.nanmean(cost_arr)),
+                "Nevergrad batch max constraint residue norm": safe_float(
+                    np.nanmax(residue_norms)
+                ),
+                "Nevergrad batch mean constraint residue norm": safe_float(
+                    np.nanmean(residue_norms)
+                ),
+            }
+            wandb.log(
+                {key: value for key, value in payload.items() if value is not None}
+            )
+
         if num_workers > 1:
             num_iters = optimizer.budget // num_workers
             for _ in tqdm(
@@ -174,6 +211,9 @@ class NevergradAugmentedLagrangian:
                     (x_lst[i].value, lambda_val, mu) for i in range(num_workers)
                 ]
                 results = pool.starmap(_multiprocessing_al_cost_func, args_list)
+                batch_losses = []
+                batch_constraint_residues = []
+                batch_cost_function_values = []
                 for i in range(num_workers):
                     al_loss, constraint_residue, cost_function_val = results[i]
                     x_suggests.append(x_lst[i].value)
@@ -181,7 +221,17 @@ class NevergradAugmentedLagrangian:
                         (al_loss, constraint_residue, cost_function_val)
                     )
                     optimizer.tell(x_lst[i], al_loss)
+                    batch_losses.append(al_loss)
+                    batch_constraint_residues.append(constraint_residue)
+                    batch_cost_function_values.append(cost_function_val)
+                num_candidate_evaluations += num_workers
+                log_nevergrad_progress(
+                    batch_losses,
+                    batch_constraint_residues,
+                    batch_cost_function_values,
+                )
         else:
+            log_every = max(1, optimizer.budget // 100)
             for _ in tqdm(
                 range(optimizer.budget),
                 total=optimizer.budget,
@@ -195,6 +245,17 @@ class NevergradAugmentedLagrangian:
                 x_suggests.append(x.value)
                 cached_results.append((al_loss, constraint_residue, cost_function_val))
                 optimizer.tell(x, al_loss)
+                num_candidate_evaluations += 1
+                if (
+                    num_candidate_evaluations == 1
+                    or num_candidate_evaluations % log_every == 0
+                    or num_candidate_evaluations == optimizer.budget
+                ):
+                    log_nevergrad_progress(
+                        [al_loss],
+                        [constraint_residue],
+                        [cost_function_val],
+                    )
 
         # Get best result at this AL iteration
         recommendation = optimizer.provide_recommendation()
