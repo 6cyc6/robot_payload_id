@@ -1,4 +1,5 @@
 import argparse
+import copy
 import os
 import sys
 import time
@@ -13,6 +14,8 @@ import yaml
 DEFAULT_SYSTEM_IDENTIFICATION_ROOT = Path(
     "/home/ikun/github_repo/6cyc6/system-identification"
 )
+DEFAULT_CAMERA_BOX_XY_SCALE = 1.1
+DEFAULT_CAMERA_BOX_Z_SCALE = 1.1
 
 
 def parse_args():
@@ -53,8 +56,8 @@ def parse_args():
         default="symmetric",
     )
     parser.add_argument("--objective_lambda", type=float, default=1e-6)
-    parser.add_argument("--eig_eps", type=float, default=1e-9)
-    parser.add_argument("--ipopt_max_iter", type=int, default=500)
+    parser.add_argument("--eig_eps", type=float, default=1e-6)
+    parser.add_argument("--ipopt_max_iter", type=int, default=1000)
     parser.add_argument("--ipopt_print_level", type=int, default=5)
     parser.add_argument(
         "--ipopt_hessian_approximation",
@@ -86,9 +89,22 @@ def parse_args():
         action="store_true",
         help="Use the physical camera-box z height even if drake_xy_prism_height is set.",
     )
-    parser.add_argument("--link_y_lower", type=float, default=-0.5)
+    parser.add_argument(
+        "--camera_box_xy_scale",
+        type=float,
+        default=DEFAULT_CAMERA_BOX_XY_SCALE,
+        help="Scale applied to camera obstacle x/y dimensions.",
+    )
+    parser.add_argument(
+        "--camera_box_z_scale",
+        type=float,
+        default=DEFAULT_CAMERA_BOX_Z_SCALE,
+        help="Scale applied to camera obstacle z dimension.",
+    )
+    parser.add_argument("--link_y_lower", type=float, default=-0.4)
     parser.add_argument("--link_y_upper", type=float, default=0.4)
-    parser.add_argument("--link_z_lower", type=float, default=0.0)
+    parser.add_argument("--link_x_lower", type=float, default=-0.15)
+    parser.add_argument("--link_z_lower", type=float, default=0.1)
     parser.add_argument(
         "--disable_link_y_bounds",
         "--disable_wall_bounds",
@@ -123,7 +139,8 @@ def bootstrap_system_identification(system_identification_root):
 
 def make_wall_bound_solver(base_solver_cls, flat_params_to_traj):
     class WallBoundDrakeMathematicalProgramExcitationSolver(base_solver_cls):
-        def __init__(self, *args, link_z_lower=0.0, **kwargs):
+        def __init__(self, *args, link_x_lower=-0.05, link_z_lower=0.1, **kwargs):
+            self.link_x_lower = float(link_x_lower)
             self.link_z_lower = float(link_z_lower)
             super().__init__(*args, **kwargs)
 
@@ -139,8 +156,10 @@ def make_wall_bound_solver(base_solver_cls, flat_params_to_traj):
                 self.collision_checker.minimum_distance_constraint_values(q_sampled)
             ]
             if self.use_link_y_bounds:
-                wall_margins = self.collision_checker.robot_link_wall_margins(
+                wall_margins = robot_link_workspace_margins(
+                    self.collision_checker,
                     q_sampled,
+                    x_lower=self.link_x_lower,
                     y_lower=self.link_y_lower,
                     y_upper=self.link_y_upper,
                     z_lower=self.link_z_lower,
@@ -156,7 +175,7 @@ def make_wall_bound_solver(base_solver_cls, flat_params_to_traj):
                     self.camera_collision_stride,
                 )
             )
-            n_wall_outputs = 3 if self.use_link_y_bounds else 0
+            n_wall_outputs = 4 if self.use_link_y_bounds else 0
             n_outputs = n_samples * (1 + n_wall_outputs)
             lower = np.zeros(n_outputs, dtype=float)
             upper = np.full(n_outputs, np.inf, dtype=float)
@@ -180,6 +199,102 @@ def min_or_inf(values):
     if values.size == 0:
         return np.inf
     return float(np.min(values))
+
+
+def robot_link_workspace_margins(
+    collision_checker,
+    q,
+    *,
+    x_lower,
+    y_lower,
+    y_upper,
+    z_lower,
+):
+    q = np.asarray(q, dtype=float)
+    if q.ndim == 1:
+        q = q.reshape(1, -1)
+
+    margins = []
+    for q_i in q:
+        xy_points = robot_workspace_sample_points(
+            collision_checker,
+            q_i,
+            min_link_index=1,
+        )
+        z_points = robot_workspace_sample_points(
+            collision_checker,
+            q_i,
+            min_link_index=2,
+        )
+        min_x = float(np.min(xy_points[:, 0]))
+        min_y = float(np.min(xy_points[:, 1]))
+        max_y = float(np.max(xy_points[:, 1]))
+        min_z = float(np.min(z_points[:, 2]))
+        margins.append(
+            (
+                min_x - collision_checker.robot_sphere_radius - float(x_lower),
+                min_y - collision_checker.robot_sphere_radius - float(y_lower),
+                float(y_upper) - max_y - collision_checker.robot_sphere_radius,
+                min_z - float(z_lower),
+            )
+        )
+    return np.asarray(margins, dtype=float)
+
+
+def robot_workspace_sample_points(collision_checker, q_i, *, min_link_index):
+    if not hasattr(collision_checker, "_robot_sample_specs"):
+        return collision_checker._robot_sample_points(q_i)
+
+    collision_checker.plant.SetPositions(
+        collision_checker.plant_context,
+        collision_checker.model_instance,
+        q_i,
+    )
+    points = []
+    for body, offset in collision_checker._robot_sample_specs:
+        body_name = body.name()
+        if not robot_body_at_or_after_link(body_name, min_link_index):
+            continue
+        x_wb = collision_checker.plant.EvalBodyPoseInWorld(
+            collision_checker.plant_context,
+            body,
+        )
+        points.append(x_wb.multiply(offset))
+    if not points:
+        return collision_checker._robot_sample_points(q_i)
+    return np.asarray(points, dtype=float)
+
+
+def robot_body_at_or_after_link(body_name, min_link_index):
+    if body_name in {"base", "world"}:
+        return False
+    if "link" in body_name:
+        suffix = body_name.rsplit("link", 1)[-1]
+        digits = "".join(char for char in suffix if char.isdigit())
+        if digits:
+            return int(digits) >= int(min_link_index)
+    return int(min_link_index) <= 2
+
+
+def scaled_camera_boxes(
+    camera_box_cls,
+    camera_box_specs_mm,
+    *,
+    xy_prism_height,
+    xy_scale,
+    z_scale,
+):
+    boxes = []
+    for name, center_mm, size_mm in camera_box_specs_mm:
+        center = np.asarray(center_mm, dtype=float) / 1000.0
+        size = np.asarray(size_mm, dtype=float) / 1000.0
+        size[:2] *= float(xy_scale)
+        if xy_prism_height is None:
+            size[2] *= float(z_scale)
+        else:
+            size[2] = float(xy_prism_height) * float(z_scale)
+        boxes.append(camera_box_cls(name=name, center=center, size=size))
+    return boxes
 
 
 def initial_solver_constraint_report(
@@ -212,8 +327,10 @@ def initial_solver_constraint_report(
     path_lbg = [np.zeros_like(path_values[0], dtype=float)]
     path_ubg = [np.ones_like(path_values[0], dtype=float)]
     if not args.disable_link_y_bounds:
-        wall_values = collision_checker.robot_link_wall_margins(
+        wall_values = robot_link_workspace_margins(
+            collision_checker,
             q_sampled,
+            x_lower=args.link_x_lower,
             y_lower=args.link_y_lower,
             y_upper=args.link_y_upper,
             z_lower=args.link_z_lower,
@@ -255,17 +372,29 @@ def initial_solver_constraint_report(
     }
 
 
-def make_collision_checker(args, drake_camera_collision_checker):
+def make_collision_checker(
+    args,
+    drake_camera_collision_checker,
+    camera_box_cls,
+    camera_box_specs_mm,
+):
     xy_prism_height = (
         None if args.drake_physical_camera_height else args.drake_xy_prism_height
+    )
+    camera_boxes = scaled_camera_boxes(
+        camera_box_cls,
+        camera_box_specs_mm,
+        xy_prism_height=xy_prism_height,
+        xy_scale=args.camera_box_xy_scale,
+        z_scale=args.camera_box_z_scale,
     )
     return drake_camera_collision_checker(
         robot_name=args.robot,
         min_distance=args.drake_min_distance,
         robot_sphere_radius=args.drake_robot_sphere_radius,
         robot_link_samples=args.drake_robot_link_samples,
+        camera_boxes=camera_boxes,
         camera_chamfer_radius=args.drake_camera_chamfer_radius,
-        xy_prism_height=xy_prism_height,
     )
 
 
@@ -432,7 +561,11 @@ def main():
     )
 
     from loguru import logger
-    from system_identification.drake.camera_collision import DrakeCameraCollisionChecker
+    from system_identification.drake.camera_collision import (
+        CAMERA_BOX_SPECS_MM,
+        CameraBox,
+        DrakeCameraCollisionChecker,
+    )
     from system_identification.drake.mathematical_program_solver import (
         DrakeMathematicalProgramExcitationSolver,
         fourier_constraint_bounds,
@@ -451,7 +584,58 @@ def main():
     from system_identification.inertia_model import InertiaModel
     from system_identification.ipopt_solver import evaluate_params_metrics
     from system_identification.utils import retrieve_robot_config, vis_compare_seqs
-    from generate_excitation_ipopt_drake import validate_trajectory
+    from generate_excitation_ipopt_drake import validate_trajectory as base_validate_trajectory
+
+    def validate_trajectory(
+        label,
+        flat_params,
+        fourier_config,
+        robot_config,
+        collision_checker,
+        args,
+    ):
+        base_args = copy.copy(args)
+        base_args.disable_link_y_bounds = True
+        result = base_validate_trajectory(
+            label,
+            flat_params,
+            fourier_config,
+            robot_config,
+            collision_checker,
+            base_args,
+        )
+        if args.disable_link_y_bounds:
+            return result
+
+        validation_stride = max(1, int(args.validation_stride))
+        q_sampled = result["q"][::validation_stride]
+        workspace_margins = robot_link_workspace_margins(
+            collision_checker,
+            q_sampled,
+            x_lower=args.link_x_lower,
+            y_lower=args.link_y_lower,
+            y_upper=args.link_y_upper,
+            z_lower=args.link_z_lower,
+        )
+        workspace_margin = float(np.min(workspace_margins))
+        result.update(
+            {
+                "valid": bool(result["valid"] and workspace_margin >= 0.0),
+                "link_wall_margin": workspace_margin,
+                "min_x_lower_margin": float(np.min(workspace_margins[:, 0])),
+                "min_y_lower_margin": float(np.min(workspace_margins[:, 1])),
+                "min_y_upper_margin": float(np.min(workspace_margins[:, 2])),
+                "min_z_margin": float(np.min(workspace_margins[:, 3])),
+            }
+        )
+        logger.info(
+            f"{label} sampled workspace margins: "
+            f"x_lower={result['min_x_lower_margin']}; "
+            f"y_lower={result['min_y_lower_margin']}; "
+            f"y_upper={result['min_y_upper_margin']}; "
+            f"z_lower={result['min_z_margin']}"
+        )
+        return result
 
     if not args.no_save:
         experiment_dir.mkdir(parents=True, exist_ok=True)
@@ -466,8 +650,14 @@ def main():
     logger.info(f"Using system-identification repo at {system_id_root}")
     logger.info(
         "FR3 workspace constraints: "
+        f"x > {args.link_x_lower}, "
         f"{args.link_y_lower} < y < {args.link_y_upper}, "
         f"z > {args.link_z_lower}; camera min distance {args.drake_min_distance}"
+    )
+    logger.info(
+        "FR3 camera boxes: x/y scale %s, z scale %s",
+        args.camera_box_xy_scale,
+        args.camera_box_z_scale,
     )
     logger.info(f"Output directory: {experiment_dir}")
 
@@ -476,7 +666,12 @@ def main():
         "order": int(args.fourier_order),
         "duration": float(args.fourier_duration),
     }
-    collision_checker = make_collision_checker(args, DrakeCameraCollisionChecker)
+    collision_checker = make_collision_checker(
+        args,
+        DrakeCameraCollisionChecker,
+        CameraBox,
+        CAMERA_BOX_SPECS_MM,
+    )
 
     init_params, initial_eval = generate_valid_initial_trajectory(
         args,
@@ -601,6 +796,7 @@ def main():
         log_condition_every=args.log_condition_every,
         early_stop_constraint_tol=args.early_stop_constraint_tol,
         use_identifiable_columns=not args.no_identifiable_column_reduction,
+        link_x_lower=args.link_x_lower,
         link_y_lower=args.link_y_lower,
         link_y_upper=args.link_y_upper,
         link_z_lower=args.link_z_lower,

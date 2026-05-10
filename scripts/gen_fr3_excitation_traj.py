@@ -50,9 +50,84 @@ DEFAULT_FR3_URDF = (
     / "fr3_description"
     / "fr3.urdf"
 )
+DEFAULT_CAMERA_BOX_XY_SCALE = 1.1
+DEFAULT_CAMERA_BOX_Z_SCALE = 1.1
 DEFAULT_FR3_Q0 = np.array(
-    [0.0, -np.pi / 4.0, 0.0, -3.0 * np.pi / 4.0, 0.0, np.pi / 2.0, np.pi / 4.0]
+    [0.0, 0.0, 0.0, -1.52715, 0.0, 1.8675, 0.0]
 )
+
+
+def project_fourier_attrs_to_endpoint_pose(
+    traj_attrs: FourierSeriesTrajectoryAttributes,
+    *,
+    start_q: np.ndarray,
+    time_horizon: float,
+) -> FourierSeriesTrajectoryAttributes:
+    a_values = np.asarray(traj_attrs.a_values, dtype=float).copy()
+    b_values = np.asarray(traj_attrs.b_values, dtype=float).copy()
+    q0_values = np.asarray(traj_attrs.q0_values, dtype=float).copy()
+    start_q = np.asarray(start_q, dtype=float).reshape(-1)
+    num_joints, num_terms = a_values.shape
+    if start_q.shape != (num_joints,):
+        raise ValueError(f"Expected start_q shape {(num_joints,)}, got {start_q.shape}")
+
+    harmonic_ids = np.arange(1, num_terms + 1, dtype=float)
+    omega = float(traj_attrs.omega)
+    duration = float(time_horizon)
+    phases = omega * harmonic_ids * duration
+    sin_t = np.sin(phases)
+    cos_t = np.cos(phases)
+    omega_l = omega * harmonic_ids
+    omega_l2 = omega_l**2
+
+    constraint_matrix = np.zeros((7, 2 * num_terms + 1), dtype=float)
+    constraint_matrix[0, -1] = 1.0
+    constraint_matrix[1, num_terms : 2 * num_terms] = 1.0
+    constraint_matrix[1, -1] = 1.0
+    constraint_matrix[2, :num_terms] = omega_l
+    constraint_matrix[3, num_terms : 2 * num_terms] = -omega_l2
+    constraint_matrix[4, :num_terms] = sin_t
+    constraint_matrix[4, num_terms : 2 * num_terms] = cos_t
+    constraint_matrix[4, -1] = 1.0
+    constraint_matrix[5, :num_terms] = omega_l * cos_t
+    constraint_matrix[5, num_terms : 2 * num_terms] = -omega_l * sin_t
+    constraint_matrix[6, :num_terms] = -omega_l2 * sin_t
+    constraint_matrix[6, num_terms : 2 * num_terms] = -omega_l2 * cos_t
+    correction_matrix = constraint_matrix.T @ np.linalg.pinv(
+        constraint_matrix @ constraint_matrix.T
+    )
+
+    for joint_idx in range(num_joints):
+        values = np.concatenate(
+            [
+                a_values[joint_idx],
+                b_values[joint_idx],
+                [q0_values[joint_idx]],
+            ]
+        )
+        desired = np.array(
+            [
+                start_q[joint_idx],
+                start_q[joint_idx],
+                0.0,
+                0.0,
+                start_q[joint_idx],
+                0.0,
+                0.0,
+            ],
+            dtype=float,
+        )
+        projected = values - correction_matrix @ (constraint_matrix @ values - desired)
+        a_values[joint_idx] = projected[:num_terms]
+        b_values[joint_idx] = projected[num_terms : 2 * num_terms]
+        q0_values[joint_idx] = projected[-1]
+
+    return FourierSeriesTrajectoryAttributes(
+        a_values=a_values,
+        b_values=b_values,
+        q0_values=q0_values,
+        omega=omega,
+    )
 
 
 class FR3ExcitationOptimizer(ExcitationTrajectoryOptimizerFourierBlackBoxALNumeric):
@@ -62,6 +137,8 @@ class FR3ExcitationOptimizer(ExcitationTrajectoryOptimizerFourierBlackBoxALNumer
         self,
         *args,
         collision_checker: Any,
+        start_q: np.ndarray,
+        link_x_lower: float,
         link_y_lower: float,
         link_y_upper: float,
         link_z_lower: float,
@@ -69,6 +146,8 @@ class FR3ExcitationOptimizer(ExcitationTrajectoryOptimizerFourierBlackBoxALNumer
         **kwargs,
     ):
         self._fr3_collision_checker = collision_checker
+        self._fr3_start_q = np.asarray(start_q, dtype=float).reshape(-1)
+        self._link_x_lower = float(link_x_lower)
         self._link_y_lower = float(link_y_lower)
         self._link_y_upper = float(link_y_upper)
         self._link_z_lower = float(link_z_lower)
@@ -95,6 +174,8 @@ class FR3ExcitationOptimizer(ExcitationTrajectoryOptimizerFourierBlackBoxALNumer
         finally:
             oed_fourier.create_arm = original_create_arm
 
+        self._project_initial_guess_to_start_pose()
+
     def _simulate_traj_and_log_recording(
         self, name: str, var_values: np.ndarray
     ) -> None:
@@ -103,6 +184,137 @@ class FR3ExcitationOptimizer(ExcitationTrajectoryOptimizerFourierBlackBoxALNumer
     @property
     def collision_checker(self) -> Any:
         return self._fr3_collision_checker
+
+    def _project_initial_guess_to_start_pose(self) -> None:
+        num_terms = self._num_fourier_terms
+        num_joints = self._num_joints
+        if self._fr3_start_q.shape != (num_joints,):
+            raise ValueError(
+                f"Expected FR3 start_q shape {(num_joints,)}, "
+                f"got {self._fr3_start_q.shape}."
+            )
+        traj_attrs = FourierSeriesTrajectoryAttributes.from_flattened_data(
+            a_values=self._initial_guess[: num_terms * num_joints],
+            b_values=self._initial_guess[
+                num_terms * num_joints : 2 * num_terms * num_joints
+            ],
+            q0_values=self._initial_guess[-num_joints:],
+            omega=self._omega,
+            num_joints=num_joints,
+        )
+        traj_attrs = project_fourier_attrs_to_endpoint_pose(
+            traj_attrs,
+            start_q=self._fr3_start_q,
+            time_horizon=self._time_horizon,
+        )
+        a_flattened, b_flattened, q0_values, _ = traj_attrs.to_flattened_data()
+        self._initial_guess = np.concatenate([a_flattened, b_flattened, q0_values])
+
+    def _add_start_and_end_point_constraints(self) -> None:
+        """Match upstream FR3 start/end pose and zero endpoint derivatives."""
+        super()._add_start_and_end_point_constraints()
+        joint_data = self._compute_joint_data(self._symbolic_vars)
+        for i in range(self._num_joints):
+            name_constraint(
+                self._prog.AddLinearConstraint(
+                    self._q0_var[i] == self._fr3_start_q[i]
+                ),
+                f"upstreamQ0Position_joint_{i}",
+            )
+            name_constraint(
+                self._prog.AddLinearConstraint(
+                    joint_data.joint_positions[0, i] == self._fr3_start_q[i]
+                ),
+                f"startPosition_joint_{i}",
+            )
+            name_constraint(
+                self._prog.AddLinearConstraint(
+                    joint_data.joint_positions[-1, i] == self._fr3_start_q[i]
+                ),
+                f"endPosition_joint_{i}",
+            )
+
+        self._add_upstream_fourier_constraints()
+
+    def _add_upstream_fourier_constraints(self) -> None:
+        """Add the coefficient-space constraints used by the upstream IPOPT script."""
+        harmonic_ids = np.arange(1, self._num_fourier_terms + 1, dtype=float)
+        omega_l = self._omega * harmonic_ids
+        omega_l2 = omega_l**2
+        position_lower_limits = self._plant.GetPositionLowerLimits().copy()
+        position_upper_limits = self._plant.GetPositionUpperLimits().copy()
+        if self._num_joints > 1:
+            position_lower_limits[1] = -1.0
+            position_upper_limits[1] = 1.0
+        position_lower_limits *= 0.9
+        position_upper_limits *= 0.9
+        offset_limits = np.minimum(
+            position_upper_limits - self._fr3_start_q,
+            self._fr3_start_q - position_lower_limits,
+        )
+        if np.any(offset_limits <= 0.0):
+            raise ValueError(
+                "FR3 start pose is outside the upstream scaled joint limits."
+            )
+        velocity_limits = np.minimum(
+            np.abs(self._plant.GetVelocityUpperLimits()),
+            10000.0,
+        )
+
+        def upstream_fourier_constraints(var_values: np.ndarray) -> np.ndarray:
+            var_values = np.asarray(var_values, dtype=float).reshape(-1)
+            num_terms = self._num_fourier_terms
+            num_joints = self._num_joints
+            a_values = var_values[: num_terms * num_joints].reshape(
+                (num_joints, num_terms),
+                order="F",
+            )
+            b_values = var_values[
+                num_terms * num_joints : 2 * num_terms * num_joints
+            ].reshape((num_joints, num_terms), order="F")
+            q0_values = var_values[-num_joints:]
+            root = np.sqrt(a_values**2 + b_values**2 + 1e-12)
+
+            values = []
+            for joint_idx in range(num_joints):
+                a = a_values[joint_idx]
+                b = b_values[joint_idx]
+                values.extend(
+                    (
+                        q0_values[joint_idx] - self._fr3_start_q[joint_idx],
+                        np.sum(b),
+                        np.dot(a, omega_l),
+                        -np.dot(b, omega_l2),
+                        np.sum(root * omega_l),
+                        np.sum(root),
+                    )
+                )
+            return np.asarray(values, dtype=float)
+
+        lower_bounds = []
+        upper_bounds = []
+        for joint_idx in range(self._num_joints):
+            lower_bounds.extend((0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+            upper_bounds.extend(
+                (
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    float(0.9 * velocity_limits[joint_idx]),
+                    float(offset_limits[joint_idx]),
+                )
+            )
+
+        name_constraint(
+            self._prog.AddConstraint(
+                func=upstream_fourier_constraints,
+                lb=np.asarray(lower_bounds, dtype=float),
+                ub=np.asarray(upper_bounds, dtype=float),
+                vars=self._symbolic_vars,
+            ),
+            "upstreamFourierEndpointAndAmplitudeBounds",
+        )
 
     def _add_collision_constraints(self, min_distance: float = 0.01) -> None:
         """Add only the FR3 camera-box and workspace wall constraints."""
@@ -124,20 +336,22 @@ class FR3ExcitationOptimizer(ExcitationTrajectoryOptimizerFourierBlackBoxALNumer
             camera_values = (
                 self._fr3_collision_checker.minimum_distance_constraint_values(q)
             )
-            wall_values = self._fr3_collision_checker.robot_link_wall_margins(
+            workspace_values = robot_link_workspace_margins(
+                self._fr3_collision_checker,
                 q,
+                x_lower=self._link_x_lower,
                 y_lower=self._link_y_lower,
                 y_upper=self._link_y_upper,
                 z_lower=self._link_z_lower,
             )
-            return np.concatenate([camera_values, wall_values.reshape(-1)])
+            return np.concatenate([camera_values, workspace_values.reshape(-1)])
 
         num_samples = len(time_indices)
-        lower_bounds = np.zeros(4 * num_samples)
+        lower_bounds = np.zeros(5 * num_samples)
         upper_bounds = np.concatenate(
             [
                 np.ones(num_samples),
-                np.full(3 * num_samples, np.inf),
+                np.full(4 * num_samples, np.inf),
             ]
         )
         name_constraint(
@@ -167,11 +381,16 @@ class FR3OptimizerFactory:
             os.makedirs(wandb.run.dir, exist_ok=True)
         bootstrap_system_identification(self.args.system_identification_root)
         from system_identification.drake.camera_collision import (
+            CAMERA_BOX_SPECS_MM,
+            CameraBox,
             DrakeCameraCollisionChecker,
         )
 
         collision_checker = make_collision_checker(
-            self.args, DrakeCameraCollisionChecker
+            self.args,
+            DrakeCameraCollisionChecker,
+            CameraBox,
+            CAMERA_BOX_SPECS_MM,
         )
         arm_components = create_arm(arm_file_path=str(self.model_path), num_joints=7)
         plant = arm_components.plant
@@ -207,6 +426,8 @@ class FR3OptimizerFactory:
             initial_guess_scaling=self.args.initial_guess_scaling,
             logging_path=self.logging_path,
             collision_checker=collision_checker,
+            start_q=self.args.fr3_start_q,
+            link_x_lower=self.args.link_x_lower,
             link_y_lower=self.args.link_y_lower,
             link_y_upper=self.args.link_y_upper,
             link_z_lower=self.args.link_z_lower,
@@ -277,8 +498,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--omega",
         type=float,
-        default=0.3 * np.pi,
-        help="Frequency of the Fourier series trajectory.",
+        default=None,
+        help=(
+            "Frequency of the Fourier series trajectory. Defaults to "
+            "2*pi/max_time_horizon, matching the upstream FR3 IPOPT script."
+        ),
     )
     parser.add_argument(
         "--num_timesteps",
@@ -429,9 +653,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use the physical camera-box z height even if xy_prism_height is set.",
     )
-    parser.add_argument("--link_y_lower", type=float, default=-0.5)
+    parser.add_argument(
+        "--camera_box_xy_scale",
+        type=float,
+        default=DEFAULT_CAMERA_BOX_XY_SCALE,
+        help="Scale applied to camera obstacle x/y dimensions.",
+    )
+    parser.add_argument(
+        "--camera_box_z_scale",
+        type=float,
+        default=DEFAULT_CAMERA_BOX_Z_SCALE,
+        help="Scale applied to camera obstacle z dimension.",
+    )
+    parser.add_argument("--link_x_lower", type=float, default=-0.05)
+    parser.add_argument("--link_y_lower", type=float, default=-0.4)
     parser.add_argument("--link_y_upper", type=float, default=0.4)
-    parser.add_argument("--link_z_lower", type=float, default=0.0)
+    parser.add_argument("--link_z_lower", type=float, default=0.1)
     return parser.parse_args()
 
 
@@ -446,6 +683,139 @@ def bootstrap_system_identification(system_identification_root: Path) -> Path:
 
 def _rewrite_model_name(name: str) -> str:
     return name.replace("panda_link", "link").replace("panda_joint", "joint")
+
+
+def fr3_init_pos_from_urdf(urdf_path: Path) -> np.ndarray:
+    urdf_path = urdf_path.expanduser().resolve()
+    if not urdf_path.exists():
+        logging.warning(
+            "FR3 URDF %s does not exist; using built-in FR3 midpoint pose.",
+            urdf_path,
+        )
+        return DEFAULT_FR3_Q0.copy()
+
+    tree = ET.parse(urdf_path)
+    joints = []
+    for joint in tree.getroot().findall("joint"):
+        if joint.attrib.get("type") == "fixed":
+            continue
+        limit = joint.find("limit")
+        if limit is None:
+            continue
+        lower = float(limit.attrib["lower"])
+        upper = float(limit.attrib["upper"])
+        joints.append(0.5 * (lower + upper))
+
+    if len(joints) < 7:
+        logging.warning(
+            "Could only read %d moving FR3 joints from %s; using built-in "
+            "FR3 midpoint pose.",
+            len(joints),
+            urdf_path,
+        )
+        return DEFAULT_FR3_Q0.copy()
+    return np.asarray(joints[:7], dtype=float)
+
+
+def robot_link_workspace_margins(
+    collision_checker: Any,
+    q: np.ndarray,
+    *,
+    x_lower: float,
+    y_lower: float,
+    y_upper: float,
+    z_lower: float,
+) -> np.ndarray:
+    q = np.asarray(q, dtype=float)
+    if q.ndim == 1:
+        q = q.reshape(1, -1)
+
+    margins = []
+    for q_i in q:
+        xy_points = robot_workspace_sample_points(
+            collision_checker,
+            q_i,
+            min_link_index=1,
+        )
+        z_points = robot_workspace_sample_points(
+            collision_checker,
+            q_i,
+            min_link_index=2,
+        )
+        min_x = float(np.min(xy_points[:, 0]))
+        min_y = float(np.min(xy_points[:, 1]))
+        max_y = float(np.max(xy_points[:, 1]))
+        min_z = float(np.min(z_points[:, 2]))
+        margins.append(
+            (
+                min_x - collision_checker.robot_sphere_radius - float(x_lower),
+                min_y - collision_checker.robot_sphere_radius - float(y_lower),
+                float(y_upper) - max_y - collision_checker.robot_sphere_radius,
+                min_z - float(z_lower),
+            )
+        )
+    return np.asarray(margins, dtype=float)
+
+
+def robot_workspace_sample_points(
+    collision_checker: Any,
+    q_i: np.ndarray,
+    *,
+    min_link_index: int,
+) -> np.ndarray:
+    if not hasattr(collision_checker, "_robot_sample_specs"):
+        return collision_checker._robot_sample_points(q_i)
+
+    collision_checker.plant.SetPositions(
+        collision_checker.plant_context,
+        collision_checker.model_instance,
+        q_i,
+    )
+    points = []
+    for body, offset in collision_checker._robot_sample_specs:
+        body_name = body.name()
+        if not robot_body_at_or_after_link(body_name, min_link_index):
+            continue
+        x_wb = collision_checker.plant.EvalBodyPoseInWorld(
+            collision_checker.plant_context,
+            body,
+        )
+        points.append(x_wb.multiply(offset))
+    if not points:
+        return collision_checker._robot_sample_points(q_i)
+    return np.asarray(points, dtype=float)
+
+
+def robot_body_at_or_after_link(body_name: str, min_link_index: int) -> bool:
+    if body_name in {"base", "world"}:
+        return False
+    if "link" in body_name:
+        suffix = body_name.rsplit("link", 1)[-1]
+        digits = "".join(char for char in suffix if char.isdigit())
+        if digits:
+            return int(digits) >= int(min_link_index)
+    return int(min_link_index) <= 2
+
+
+def scaled_camera_boxes(
+    camera_box_cls: Any,
+    camera_box_specs_mm: Any,
+    *,
+    xy_prism_height: Optional[float],
+    xy_scale: float,
+    z_scale: float,
+) -> list[Any]:
+    boxes = []
+    for name, center_mm, size_mm in camera_box_specs_mm:
+        center = np.asarray(center_mm, dtype=float) / 1000.0
+        size = np.asarray(size_mm, dtype=float) / 1000.0
+        size[:2] *= float(xy_scale)
+        if xy_prism_height is None:
+            size[2] *= float(z_scale)
+        else:
+            size[2] = float(xy_prism_height) * float(z_scale)
+        boxes.append(camera_box_cls(name=name, center=center, size=size))
+    return boxes
 
 
 def write_repo_compatible_fr3_urdf(
@@ -496,9 +866,10 @@ def write_repo_compatible_fr3_urdf(
 def write_fr3_model_directives(
     model_path: Path,
     normalized_urdf_path: Path,
+    default_q: np.ndarray,
 ) -> None:
     default_joint_positions = {
-        f"joint{i + 1}": [float(DEFAULT_FR3_Q0[i])] for i in range(7)
+        f"joint{i + 1}": [float(default_q[i])] for i in range(7)
     }
     directives = {
         "directives": [
@@ -539,9 +910,21 @@ def yaml_safe(value: Any) -> Any:
     return value
 
 
-def make_collision_checker(args: argparse.Namespace, checker_cls: Any) -> Any:
+def make_collision_checker(
+    args: argparse.Namespace,
+    checker_cls: Any,
+    camera_box_cls: Any,
+    camera_box_specs_mm: Any,
+) -> Any:
     xy_prism_height = (
         None if args.drake_physical_camera_height else args.drake_xy_prism_height
+    )
+    camera_boxes = scaled_camera_boxes(
+        camera_box_cls,
+        camera_box_specs_mm,
+        xy_prism_height=xy_prism_height,
+        xy_scale=args.camera_box_xy_scale,
+        z_scale=args.camera_box_z_scale,
     )
     return checker_cls(
         robot_name="fr3",
@@ -549,8 +932,8 @@ def make_collision_checker(args: argparse.Namespace, checker_cls: Any) -> Any:
         min_distance=args.drake_min_distance,
         robot_sphere_radius=args.drake_robot_sphere_radius,
         robot_link_samples=args.drake_robot_link_samples,
+        camera_boxes=camera_boxes,
         camera_chamfer_radius=args.drake_camera_chamfer_radius,
-        xy_prism_height=xy_prism_height,
     )
 
 
@@ -578,26 +961,54 @@ def evaluate_constraints(
     joint_positions: np.ndarray,
     collision_checker: Any,
     args: argparse.Namespace,
+    joint_velocities: Optional[np.ndarray] = None,
+    joint_accelerations: Optional[np.ndarray] = None,
 ) -> dict[str, float]:
     stride = max(1, int(args.collision_constraint_stride))
     q_sampled = joint_positions[::stride]
     collision_values = collision_checker.minimum_distance_constraint_values(q_sampled)
-    wall_values = collision_checker.robot_link_wall_margins(
+    workspace_values = robot_link_workspace_margins(
+        collision_checker,
         q_sampled,
+        x_lower=args.link_x_lower,
         y_lower=args.link_y_lower,
         y_upper=args.link_y_upper,
         z_lower=args.link_z_lower,
     )
 
-    return {
+    report = {
         "constraint_stride": stride,
         "num_constraint_samples": int(len(q_sampled)),
         "min_camera_constraint_value": float(np.min(collision_values)),
         "min_camera_clearance": float(collision_checker.min_clearance(q_sampled)),
-        "min_y_lower_margin": float(np.min(wall_values[:, 0])),
-        "min_y_upper_margin": float(np.min(wall_values[:, 1])),
-        "min_z_margin": float(np.min(wall_values[:, 2])),
+        "min_x_lower_margin": float(np.min(workspace_values[:, 0])),
+        "min_y_lower_margin": float(np.min(workspace_values[:, 1])),
+        "min_y_upper_margin": float(np.min(workspace_values[:, 2])),
+        "min_z_margin": float(np.min(workspace_values[:, 3])),
     }
+    if hasattr(args, "fr3_start_q"):
+        start_q = np.asarray(args.fr3_start_q, dtype=float)
+        report["start_position_error"] = float(
+            np.max(np.abs(np.asarray(joint_positions[0], dtype=float) - start_q))
+        )
+        report["end_position_error"] = float(
+            np.max(np.abs(np.asarray(joint_positions[-1], dtype=float) - start_q))
+        )
+    if joint_velocities is not None:
+        endpoint_velocities = np.asarray(
+            [joint_velocities[0], joint_velocities[-1]],
+            dtype=float,
+        )
+        report["endpoint_velocity_error"] = float(np.max(np.abs(endpoint_velocities)))
+    if joint_accelerations is not None:
+        endpoint_accelerations = np.asarray(
+            [joint_accelerations[0], joint_accelerations[-1]],
+            dtype=float,
+        )
+        report["endpoint_acceleration_error"] = float(
+            np.max(np.abs(endpoint_accelerations))
+        )
+    return report
 
 
 def resolve_logging_path(logging_path: Optional[Path]) -> Optional[Path]:
@@ -616,7 +1027,12 @@ def optimize_with_workers(
     mu_initial: float,
 ) -> FourierSeriesTrajectoryAttributes:
     if num_workers == 1:
-        return optimizer.optimize()
+        traj_attrs = optimizer.optimize()
+        return project_fourier_attrs_to_endpoint_pose(
+            traj_attrs,
+            start_q=optimizer._fr3_start_q,
+            time_horizon=optimizer._time_horizon,
+        )
 
     logging.info("Starting FR3 parallel optimization with %d workers.", num_workers)
     logging.info(
@@ -636,7 +1052,12 @@ def optimize_with_workers(
         num_workers=num_workers,
         log_check_point_callback=optimizer._extract_and_log_optimization_result,
     )
-    return optimizer._extract_fourier_trajectory_attributes(x_val)
+    traj_attrs = optimizer._extract_fourier_trajectory_attributes(x_val)
+    return project_fourier_attrs_to_endpoint_pose(
+        traj_attrs,
+        start_q=optimizer._fr3_start_q,
+        time_horizon=optimizer._time_horizon,
+    )
 
 
 def main() -> None:
@@ -657,6 +1078,9 @@ def main() -> None:
     )
 
     args.robot_urdf_path = args.robot_urdf_path.expanduser().resolve()
+    args.fr3_start_q = fr3_init_pos_from_urdf(args.robot_urdf_path)
+    if args.omega is None:
+        args.omega = 2.0 * np.pi / args.max_time_horizon
     logging_path = resolve_logging_path(args.logging_path)
     temporary_dir: Optional[tempfile.TemporaryDirectory[str]] = None
     if logging_path is None:
@@ -668,7 +1092,7 @@ def main() -> None:
     normalized_urdf_path = generated_model_dir / "fr3_repo_names.urdf"
     model_path = generated_model_dir / "fr3_repo_names.dmd.yaml"
     write_repo_compatible_fr3_urdf(args.robot_urdf_path, normalized_urdf_path)
-    write_fr3_model_directives(model_path, normalized_urdf_path)
+    write_fr3_model_directives(model_path, normalized_urdf_path, args.fr3_start_q)
 
     np.random.seed(args.seed)
     logging.info(
@@ -676,10 +1100,21 @@ def main() -> None:
     )
     logging.info("Using generated FR3 model directives at %s", model_path)
     logging.info(
-        "FR3 workspace constraints: %s < y < %s, z > %s",
+        "FR3 start/end pose: %s",
+        np.array2string(args.fr3_start_q, precision=6),
+    )
+    logging.info("FR3 Fourier omega: %s rad/s", args.omega)
+    logging.info(
+        "FR3 workspace constraints: x > %s, %s < y < %s, z > %s",
+        args.link_x_lower,
         args.link_y_lower,
         args.link_y_upper,
         args.link_z_lower,
+    )
+    logging.info(
+        "FR3 camera boxes: x/y scale %s, z scale %s",
+        args.camera_box_xy_scale,
+        args.camera_box_z_scale,
     )
 
     run_name = f"fr3_excitation_design {datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
@@ -744,6 +1179,11 @@ def main() -> None:
                 joint_data.joint_positions,
                 optimizer.collision_checker,
                 args,
+                joint_velocities=joint_data.joint_velocities,
+                joint_accelerations=joint_data.joint_accelerations,
+            )
+            constraint_report["q0_position_error"] = float(
+                np.max(np.abs(traj_attrs.q0_values - args.fr3_start_q))
             )
             constraint_report["optimization_time_s"] = elapsed
             with open(
