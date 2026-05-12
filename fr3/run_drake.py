@@ -1,5 +1,6 @@
 import argparse
 import os
+import select
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -18,7 +19,9 @@ from pydrake.all import (
     MeshcatVisualizer,
     Parser,
     RigidTransform,
+    Rgba,
     SpatialInertia,
+    Sphere,
     StartMeshcat,
     UnitInertia,
 )
@@ -32,8 +35,11 @@ from system_identification.drake.camera_collision import (
     CAMERA_BOX_HEIGHT_SCALE,
     CAMERA_BOX_MARGIN_SCALE,
     CAMERA_BOX_SPECS_MM,
+    DEFAULT_FIXED_COLLISION_JOINTS,
+    DEFAULT_FR3_SELF_COLLISION_BODY_PAIRS,
     DrakeCameraCollisionChecker,
     find_robot_urdf,
+    normalize_robot_body_pairs,
 )
 
 from robot_payload_id.data import (
@@ -41,7 +47,10 @@ from robot_payload_id.data import (
 )
 from robot_payload_id.utils import FourierSeriesTrajectoryAttributes
 
-DEFAULT_FR3_URDF = SCRIPT_DIR / "robot_description" / "fr3_description" / "fr3.urdf"
+DEFAULT_FR3_URDF = (
+    SCRIPT_DIR / "robot_description" / "fr3_description" / "fr3_gripper.urdf"
+)
+DEFAULT_TRAJECTORY_ROOT = SCRIPT_DIR / "logs"
 
 
 def _candidate_paths(path):
@@ -52,6 +61,8 @@ def _candidate_paths(path):
         Path.cwd() / path,
         PROJECT_ROOT / path,
         SCRIPT_DIR / path,
+        DEFAULT_TRAJECTORY_ROOT / path,
+        DEFAULT_TRAJECTORY_ROOT / "fr3_excitation" / path,
     ]
 
 
@@ -70,13 +81,19 @@ def resolve_traj_path(path):
         )
 
     candidates = []
-    folder = SCRIPT_DIR / "saves"
+    folder = DEFAULT_TRAJECTORY_ROOT
     if folder.exists():
-        for pattern in ("*.csv", "*.npy"):
+        for pattern in (
+            "**/selected.csv",
+            "**/best_condition.csv",
+            "**/final.csv",
+            "**/initial.csv",
+            "**/*.npy",
+        ):
             candidates.extend(folder.glob(pattern))
 
     if not candidates:
-        raise FileNotFoundError("No saved trajectory found under scripts/saves/")
+        raise FileNotFoundError(f"No saved trajectory found under {folder}")
     return max(candidates, key=lambda candidate: candidate.stat().st_mtime)
 
 
@@ -154,6 +171,45 @@ def resolve_robot_urdf_path(robot_name, robot_urdf_path):
     return find_robot_urdf(robot_name)
 
 
+def parse_urdf_tolerant(urdf_path):
+    try:
+        return ET.parse(urdf_path)
+    except ET.ParseError as parse_error:
+        lines = Path(urdf_path).read_text(encoding="utf-8").splitlines()
+        cleaned_lines = []
+        previous_nonempty = ""
+        removed_extra_link_close = False
+        for line in lines:
+            stripped = line.strip()
+            if (
+                not removed_extra_link_close
+                and stripped == "</link>"
+                and previous_nonempty == "</joint>"
+            ):
+                removed_extra_link_close = True
+                continue
+            cleaned_lines.append(line)
+            if stripped:
+                previous_nonempty = stripped
+        if not removed_extra_link_close:
+            raise parse_error
+        return ET.ElementTree(ET.fromstring("\n".join(cleaned_lines) + "\n"))
+
+
+def fix_visualization_only_joints(
+    urdf_root,
+    joint_names=DEFAULT_FIXED_COLLISION_JOINTS,
+):
+    joint_names = set(joint_names)
+    for joint in urdf_root.findall("joint"):
+        if joint.attrib.get("name") not in joint_names:
+            continue
+        joint.attrib["type"] = "fixed"
+        for tag in ("axis", "limit", "mimic", "dynamics"):
+            for elem in list(joint.findall(tag)):
+                joint.remove(elem)
+
+
 def root_link_name(urdf_root):
     link_names = {link.attrib["name"] for link in urdf_root.findall("link")}
     child_links = {
@@ -168,7 +224,7 @@ def root_link_name(urdf_root):
 
 
 def visual_only_urdf_xml(urdf_path):
-    tree = ET.parse(urdf_path)
+    tree = parse_urdf_tolerant(urdf_path)
     root = tree.getroot()
 
     for link in root.findall("link"):
@@ -178,6 +234,8 @@ def visual_only_urdf_xml(urdf_path):
     for joint in root.findall("joint"):
         for elem in list(joint.findall("safety_controller")):
             joint.remove(elem)
+
+    fix_visualization_only_joints(root)
 
     for mesh in root.iter("mesh"):
         filename = mesh.attrib.get("filename")
@@ -387,46 +445,57 @@ def robot_link_workspace_margins(
 
     margins = []
     for q_i in q:
-        xy_points = robot_workspace_sample_points(
+        xy_points, xy_radii = robot_workspace_sample_points_and_radii(
             checker,
             q_i,
             min_link_index=1,
         )
-        z_points = robot_workspace_sample_points(
+        z_points, z_radii = robot_workspace_sample_points_and_radii(
             checker,
             q_i,
             min_link_index=2,
         )
-        min_x = float(np.min(xy_points[:, 0]))
-        min_y = float(np.min(xy_points[:, 1]))
-        max_y = float(np.max(xy_points[:, 1]))
-        min_z = float(np.min(z_points[:, 2]))
         margins.append(
             (
-                min_x - checker.robot_sphere_radius - float(x_lower),
-                min_y - checker.robot_sphere_radius - float(y_lower),
-                float(y_upper) - max_y - checker.robot_sphere_radius,
-                min_z - float(z_lower),
+                float(np.min(xy_points[:, 0] - xy_radii)) - float(x_lower),
+                float(np.min(xy_points[:, 1] - xy_radii)) - float(y_lower),
+                float(y_upper) - float(np.max(xy_points[:, 1] + xy_radii)),
+                float(np.min(z_points[:, 2] - z_radii)) - float(z_lower),
             )
         )
     return np.asarray(margins, dtype=float)
 
 
 def robot_workspace_sample_points(checker, q_i, *, min_link_index):
+    points, _radii = robot_workspace_sample_points_and_radii(
+        checker,
+        q_i,
+        min_link_index=min_link_index,
+    )
+    return points
+
+
+def robot_workspace_sample_points_and_radii(checker, q_i, *, min_link_index):
     if not hasattr(checker, "_robot_sample_specs"):
-        return checker._robot_sample_points(q_i)
+        points = checker._robot_sample_points(q_i)
+        radii = np.full(len(points), checker.robot_sphere_radius)
+        return points, radii
 
     checker.plant.SetPositions(checker.plant_context, checker.model_instance, q_i)
     points = []
-    for body, offset in checker._robot_sample_specs:
+    radii = []
+    for body, offset, radius in checker._robot_sample_specs:
         body_name = body.name()
         if not robot_body_at_or_after_link(body_name, min_link_index):
             continue
         x_wb = checker.plant.EvalBodyPoseInWorld(checker.plant_context, body)
         points.append(x_wb.multiply(offset))
+        radii.append(float(radius))
     if not points:
-        return checker._robot_sample_points(q_i)
-    return np.asarray(points, dtype=float)
+        points = checker._robot_sample_points(q_i)
+        radii = np.full(len(points), checker.robot_sphere_radius)
+        return points, radii
+    return np.asarray(points, dtype=float), np.asarray(radii, dtype=float)
 
 
 def robot_body_at_or_after_link(body_name, min_link_index):
@@ -438,6 +507,48 @@ def robot_body_at_or_after_link(body_name, min_link_index):
         if digits:
             return int(digits) >= int(min_link_index)
     return int(min_link_index) <= 2
+
+
+def report_robot_self_collision(
+    q,
+    t,
+    checker,
+    *,
+    stride,
+    clearance,
+    body_pairs=DEFAULT_FR3_SELF_COLLISION_BODY_PAIRS,
+):
+    sample_indices = np.arange(0, len(q), max(1, int(stride)))
+    margins = checker.robot_self_collision_pair_margins(
+        q[sample_indices],
+        body_pairs=body_pairs,
+    )
+    if margins.size == 0:
+        logger.info(
+            "Franka self-collision check skipped: no configured body pairs."
+        )
+        return np.inf
+
+    local_sample_idx, pair_idx = np.unravel_index(int(np.argmin(margins)), margins.shape)
+    best_margin = float(margins[local_sample_idx, pair_idx])
+    best_global_idx = int(sample_indices[local_sample_idx])
+    first_body, second_body = normalize_robot_body_pairs(body_pairs)[pair_idx]
+    logger.info(
+        "Franka self-collision sphere margin: "
+        f"min={best_margin} at sample={best_global_idx}, t={t[best_global_idx]}, "
+        f"{first_body} vs {second_body} "
+        f"(clearance threshold={clearance})"
+    )
+    if best_margin < float(clearance):
+        logger.warning(
+            "Possible Franka self-collision under saved-sphere approximation: "
+            f"margin {best_margin} < {clearance}."
+        )
+    else:
+        logger.info(
+            "Trajectory satisfies sampled Franka self-collision sphere check."
+        )
+    return best_margin
 
 
 def report_link_workspace_bounds(
@@ -487,6 +598,51 @@ def report_link_workspace_bounds(
     return margins
 
 
+def _safe_meshcat_name(name):
+    return "".join(char if char.isalnum() or char in "_-" else "_" for char in name)
+
+
+def robot_sample_points_with_body_names(checker, q_i):
+    if not hasattr(checker, "_robot_sample_specs"):
+        points = checker._robot_sample_points(q_i)
+        return [
+            (f"sample_{idx}", point, checker.robot_sphere_radius)
+            for idx, point in enumerate(points)
+        ]
+
+    checker.plant.SetPositions(checker.plant_context, checker.model_instance, q_i)
+    samples = []
+    for body, offset, radius in checker._robot_sample_specs:
+        x_wb = checker.plant.EvalBodyPoseInWorld(checker.plant_context, body)
+        samples.append((body.name(), x_wb.multiply(offset), float(radius)))
+    return samples
+
+
+def setup_robot_sample_markers(meshcat, checker, *, marker_radius):
+    meshcat.Delete("/robot_sample_specs")
+    for idx, (body, _offset, radius) in enumerate(checker._robot_sample_specs):
+        body_name = body.name()
+        is_gripper = "hand" in body_name or "finger" in body_name
+        color = Rgba(1.0, 0.45, 0.05, 0.95) if is_gripper else Rgba(
+            0.0, 0.55, 1.0, 0.9
+        )
+        path = f"/robot_sample_specs/{idx:03d}_{_safe_meshcat_name(body_name)}"
+        display_radius = float(radius) if marker_radius is None else float(marker_radius)
+        meshcat.SetObject(path, Sphere(max(display_radius, 1e-4)), color)
+    logger.info(
+        "Visualizing %d robot sample specs in Meshcat: blue=arm, orange=gripper.",
+        len(checker._robot_sample_specs),
+    )
+
+
+def publish_robot_sample_markers(meshcat, checker, q_i):
+    for idx, (body_name, point, _radius) in enumerate(
+        robot_sample_points_with_body_names(checker, q_i)
+    ):
+        path = f"/robot_sample_specs/{idx:03d}_{_safe_meshcat_name(body_name)}"
+        meshcat.SetTransform(path, RigidTransform(point))
+
+
 def play_trajectory(
     diagram,
     context,
@@ -498,6 +654,8 @@ def play_trajectory(
     *,
     playback_stride,
     speed,
+    meshcat=None,
+    robot_sample_checker=None,
 ):
     playback_stride = max(1, int(playback_stride))
     speed = max(float(speed), 1e-9)
@@ -509,6 +667,8 @@ def play_trajectory(
         context.SetTime(float(t[current_idx]))
         plant.SetPositions(plant_context, model_instance, q[current_idx])
         diagram.ForcedPublish(context)
+        if meshcat is not None and robot_sample_checker is not None:
+            publish_robot_sample_markers(meshcat, robot_sample_checker, q[current_idx])
 
         if next_idx != current_idx:
             delay = max(float(t[next_idx] - t[current_idx]) / speed, 0.0)
@@ -529,6 +689,44 @@ def wait_for_meshcat_start(meshcat, button_name):
         meshcat.DeleteButton(button_name, strict=False)
 
 
+def hold_with_replay_button(
+    meshcat,
+    button_name,
+    play_once,
+):
+    meshcat.AddButton(button_name, "r")
+    logger.info(
+        f"Playback finished. Click Meshcat button '{button_name}' "
+        "or press r in the Meshcat browser to replay. Press Enter here to exit."
+    )
+    clicks = meshcat.GetButtonClicks(button_name)
+    try:
+        while True:
+            if sys.stdin.isatty():
+                readable, _writable, _error = select.select([sys.stdin], [], [], 0.1)
+                if readable:
+                    sys.stdin.readline()
+                    return
+            else:
+                return
+
+            new_clicks = meshcat.GetButtonClicks(button_name)
+            if new_clicks <= clicks:
+                continue
+
+            clicks = new_clicks
+            logger.info("Replay requested from Meshcat.")
+            play_once()
+            logger.info(
+                f"Replay finished. Click Meshcat button '{button_name}' again "
+                "or press Enter here to exit."
+            )
+    except KeyboardInterrupt:
+        logger.info("Interrupted; exiting Meshcat playback.")
+    finally:
+        meshcat.DeleteButton(button_name, strict=False)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Replay a trajectory in Drake/Meshcat with camera collision boxes."
@@ -537,7 +735,7 @@ def main():
         "trajectory",
         nargs="?",
         default=None,
-        help="Trajectory CSV/NPY. Defaults to the latest file under script/saves.",
+        help="Trajectory CSV/NPY. Defaults to the latest trajectory under fr3/logs.",
     )
     parser.add_argument("--robot", type=str, default="fr3")
     parser.add_argument(
@@ -546,13 +744,13 @@ def main():
         default=None,
         help=(
             "Robot URDF path. Defaults to the vendored FR3 URDF under fr3/ "
-            "when --robot fr3."
+            "when --robot fr3. The default is the local FR3 gripper URDF."
         ),
     )
     parser.add_argument("--camera_collision_stride", type=int, default=5)
-    parser.add_argument("--drake_min_distance", type=float, default=0.0)
+    parser.add_argument("--drake_min_distance", type=float, default=0.02)
     parser.add_argument("--drake_robot_sphere_radius", type=float, default=0.05)
-    parser.add_argument("--drake_robot_link_samples", type=int, default=7)
+    parser.add_argument("--drake_robot_link_samples", type=int, default=5)
     parser.add_argument("--drake_camera_chamfer_radius", type=float, default=0.02)
     parser.add_argument(
         "--camera_box_xy_scale",
@@ -571,6 +769,30 @@ def main():
     parser.add_argument("--link_y_upper", type=float, default=0.4)
     parser.add_argument("--link_z_lower", type=float, default=0.1)
     parser.add_argument("--disable_link_y_bounds", action="store_true")
+    parser.add_argument(
+        "--self_collision_check",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Check possible Franka self-collision using the saved collision "
+            "spheres for the configured FR3 body pairs."
+        ),
+    )
+    parser.add_argument(
+        "--self_collision_stride",
+        type=int,
+        default=None,
+        help="Sampling stride for self-collision checks. Defaults to camera_collision_stride.",
+    )
+    parser.add_argument(
+        "--self_collision_clearance",
+        type=float,
+        default=0.0,
+        help=(
+            "Required minimum sphere clearance for the configured Franka "
+            "self-collision pairs."
+        ),
+    )
     parser.add_argument(
         "--drake_xy_prism_height",
         type=float,
@@ -593,8 +815,29 @@ def main():
     )
     parser.add_argument("--no_start_button", dest="start_button", action="store_false")
     parser.add_argument("--start_button_name", type=str, default="Start playback")
+    parser.add_argument(
+        "--replay_button",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show a Meshcat button that replays the trajectory after playback.",
+    )
+    parser.add_argument("--replay_button_name", type=str, default="Replay trajectory")
     parser.add_argument("--playback_stride", type=int, default=1)
     parser.add_argument("--speed", type=float, default=1.0)
+    parser.add_argument(
+        "--show_robot_samples",
+        action="store_true",
+        help="Draw the Drake robot sample specs used for workspace/collision checks.",
+    )
+    parser.add_argument(
+        "--robot_sample_marker_radius",
+        type=float,
+        default=None,
+        help=(
+            "Radius of the Meshcat spheres for --show_robot_samples. "
+            "Defaults to each saved collision sphere radius."
+        ),
+    )
     parser.add_argument(
         "--num_timesteps",
         type=int,
@@ -661,8 +904,19 @@ def main():
             y_upper=args.link_y_upper,
             z_lower=args.link_z_lower,
         )
+    self_collision_margin = np.inf
+    if args.self_collision_check:
+        self_collision_margin = report_robot_self_collision(
+            q,
+            t,
+            checker,
+            stride=args.self_collision_stride or args.camera_collision_stride,
+            clearance=args.self_collision_clearance,
+        )
     if args.stop_on_collision and (
-        np.min(collision_values) < 0.0 or np.min(workspace_margins) < 0.0
+        np.min(collision_values) < 0.0
+        or np.min(workspace_margins) < 0.0
+        or self_collision_margin < args.self_collision_clearance
     ):
         raise SystemExit(1)
 
@@ -696,6 +950,13 @@ def main():
     context.SetTime(float(t[0]))
     plant.SetPositions(plant_context, model_instance, q[0])
     diagram.ForcedPublish(context)
+    if args.show_robot_samples:
+        setup_robot_sample_markers(
+            meshcat,
+            checker,
+            marker_radius=args.robot_sample_marker_radius,
+        )
+        publish_robot_sample_markers(meshcat, checker, q[0])
     if args.start_button:
         wait_for_meshcat_start(meshcat, args.start_button_name)
 
@@ -703,24 +964,32 @@ def main():
         f"Playing trajectory in Meshcat at speed={args.speed}, "
         f"playback_stride={args.playback_stride}"
     )
-    play_trajectory(
-        diagram,
-        context,
-        plant,
-        plant_context,
-        model_instance,
-        t,
-        q,
-        playback_stride=args.playback_stride,
-        speed=args.speed,
-    )
+    def play_once():
+        play_trajectory(
+            diagram,
+            context,
+            plant,
+            plant_context,
+            model_instance,
+            t,
+            q,
+            playback_stride=args.playback_stride,
+            speed=args.speed,
+            meshcat=meshcat if args.show_robot_samples else None,
+            robot_sample_checker=checker if args.show_robot_samples else None,
+        )
+
+    play_once()
     logger.info("Playback finished.")
 
     if args.hold:
-        try:
-            input("Press Enter to exit Meshcat playback...")
-        except EOFError:
-            logger.info("No stdin available; exiting Meshcat playback.")
+        if args.replay_button:
+            hold_with_replay_button(meshcat, args.replay_button_name, play_once)
+        else:
+            try:
+                input("Press Enter to exit Meshcat playback...")
+            except EOFError:
+                logger.info("No stdin available; exiting Meshcat playback.")
 
 
 if __name__ == "__main__":

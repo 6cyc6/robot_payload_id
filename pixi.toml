@@ -23,6 +23,7 @@ pinocchio = ">=4.0.0,<5"
 loguru = ">=0.7.3,<0.8"
 casadi = ">=3.7.2,<4"
 trimesh = ">=4.12.2,<5"
+mujoco = ">=3.8.1,<4"
 
 [pypi-options.dependency-overrides]
 drake = "==1.36.0"

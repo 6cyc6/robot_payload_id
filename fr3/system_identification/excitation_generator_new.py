@@ -199,18 +199,30 @@ def generate_fourier_traj(
 #     return True
 
 
+def _scaled_sample_limits(robot_config, scale=0.95):
+    upper = np.array(robot_config["upper_joint_pos_limits"], dtype=float).copy()
+    lower = np.array(robot_config["lower_joint_pos_limits"], dtype=float).copy()
+    vel_limit = np.array(robot_config["joint_vel_limits"], dtype=float).copy()
+
+    # Match the Fourier/IPOPT envelope used by the Drake solver.
+    if len(upper) > 1:
+        lower[1] = -1.0
+        upper[1] = 1.0
+
+    return lower * scale, upper * scale, vel_limit * scale
+
+
 def is_traj_valid(q, dq, ddq, robot_config):
-    upper = np.array(robot_config["upper_joint_pos_limits"])
-    lower = np.array(robot_config["lower_joint_pos_limits"])
-    vel_limit = np.array(robot_config["joint_vel_limits"])
+    lower, upper, vel_limit = _scaled_sample_limits(robot_config, scale=0.95)
     return np.all(q <= upper) and np.all(q >= lower) and np.all(np.abs(dq) <= vel_limit)
 
 
 def is_traj_valid_jointwise(q, dq, ddq, robot_config, joint_id):
+    lower, upper, vel_limit = _scaled_sample_limits(robot_config, scale=0.95)
     upperPosLimit, lowerPosLimit, velLimit = (
-        robot_config["upper_joint_pos_limits"][joint_id],
-        robot_config["lower_joint_pos_limits"][joint_id],
-        robot_config["joint_vel_limits"][joint_id],
+        upper[joint_id],
+        lower[joint_id],
+        vel_limit[joint_id],
     )
     for q_i, dq_i, ddq_i in zip(q, dq, ddq):
         for j in range(len(q_i)):

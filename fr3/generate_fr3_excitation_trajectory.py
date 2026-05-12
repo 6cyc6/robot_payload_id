@@ -13,6 +13,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+DEFAULT_FR3_GRIPPER_URDF = (
+    SCRIPT_DIR / "robot_description" / "fr3_description" / "fr3_gripper.urdf"
+)
 DEFAULT_CAMERA_BOX_XY_SCALE = 1.1
 DEFAULT_CAMERA_BOX_Z_SCALE = 1.1
 
@@ -25,6 +28,15 @@ def parse_args():
         )
     )
     parser.add_argument("--robot", type=str, default="fr3")
+    parser.add_argument(
+        "--robot_urdf_path",
+        type=Path,
+        default=DEFAULT_FR3_GRIPPER_URDF,
+        help=(
+            "URDF used by the Drake collision checker. Defaults to the local "
+            "FR3 gripper URDF; the optimized trajectory is still the 7-DOF arm."
+        ),
+    )
     parser.add_argument(
         "--save_dir",
         type=Path,
@@ -59,8 +71,27 @@ def parse_args():
         default="limited-memory",
     )
     parser.add_argument("--log_condition_every", type=int, default=5)
-    parser.add_argument("--best_condition_check_every", type=int, default=5)
+    parser.add_argument("--best_condition_check_every", type=int, default=3)
     parser.add_argument("--initial_best_condition_number", type=float, default=1e7)
+    parser.add_argument(
+        "--best_condition_fourier_velocity_margin_tolerance",
+        type=float,
+        default=0.0,
+        help=(
+            "Allow best-condition validation when the 0.95x Fourier velocity "
+            "margin is no smaller than this negative tolerance."
+        ),
+    )
+    parser.add_argument(
+        "--best_condition_fourier_position_margin_tolerance",
+        type=float,
+        default=0.0,
+        help=(
+            "Allow best-condition validation when the 0.95x Fourier position "
+            "margin is no smaller than this negative tolerance. Collision, "
+            "workspace, and self-collision margins remain hard."
+        ),
+    )
     parser.add_argument("--early_stop_constraint_tol", type=float, default=1e-6)
     parser.add_argument("--camera_collision_stride", type=int, default=2)
     parser.add_argument("--validation_stride", type=int, default=1)
@@ -99,6 +130,17 @@ def parse_args():
     parser.add_argument("--link_x_lower", type=float, default=-0.15)
     parser.add_argument("--link_z_lower", type=float, default=0.1)
     parser.add_argument(
+        "--disable_self_collision_constraints",
+        action="store_true",
+        help="Disable the configured Franka self-collision sphere-pair constraints.",
+    )
+    parser.add_argument(
+        "--self_collision_clearance",
+        type=float,
+        default=0.0,
+        help="Minimum clearance for the configured Franka self-collision sphere pairs.",
+    )
+    parser.add_argument(
         "--disable_link_y_bounds",
         "--disable_wall_bounds",
         dest="disable_link_y_bounds",
@@ -118,9 +160,21 @@ def parse_args():
 
 def make_wall_bound_solver(base_solver_cls, flat_params_to_traj):
     class WallBoundDrakeMathematicalProgramExcitationSolver(base_solver_cls):
-        def __init__(self, *args, link_x_lower=-0.05, link_z_lower=0.1, **kwargs):
+        def __init__(
+            self,
+            *args,
+            link_x_lower=-0.15,
+            link_z_lower=0.1,
+            use_self_collision_constraints=True,
+            self_collision_body_pairs=(),
+            self_collision_clearance=0.0,
+            **kwargs,
+        ):
             self.link_x_lower = float(link_x_lower)
             self.link_z_lower = float(link_z_lower)
+            self.use_self_collision_constraints = bool(use_self_collision_constraints)
+            self.self_collision_body_pairs = tuple(self_collision_body_pairs)
+            self.self_collision_clearance = float(self_collision_clearance)
             super().__init__(*args, **kwargs)
 
         def _path_constraint_values(self, flat_params):
@@ -134,6 +188,14 @@ def make_wall_bound_solver(base_solver_cls, flat_params_to_traj):
             values = [
                 self.collision_checker.minimum_distance_constraint_values(q_sampled)
             ]
+            if self.use_self_collision_constraints:
+                self_collision_margins = (
+                    self.collision_checker.robot_self_collision_pair_margins(
+                        q_sampled,
+                        body_pairs=self.self_collision_body_pairs,
+                    )
+                )
+                values.append(self_collision_margins.reshape(-1))
             if self.use_link_y_bounds:
                 wall_margins = robot_link_workspace_margins(
                     self.collision_checker,
@@ -154,11 +216,22 @@ def make_wall_bound_solver(base_solver_cls, flat_params_to_traj):
                     self.camera_collision_stride,
                 )
             )
+            n_self_collision_outputs = (
+                len(self.self_collision_body_pairs)
+                if self.use_self_collision_constraints
+                else 0
+            )
             n_wall_outputs = 4 if self.use_link_y_bounds else 0
-            n_outputs = n_samples * (1 + n_wall_outputs)
+            n_outputs = n_samples * (
+                1 + n_self_collision_outputs + n_wall_outputs
+            )
             lower = np.zeros(n_outputs, dtype=float)
             upper = np.full(n_outputs, np.inf, dtype=float)
             upper[:n_samples] = 1.0
+            if n_self_collision_outputs:
+                start = n_samples
+                stop = start + n_samples * n_self_collision_outputs
+                lower[start:stop] = self.self_collision_clearance
             return lower, upper
 
     return WallBoundDrakeMathematicalProgramExcitationSolver
@@ -195,34 +268,41 @@ def robot_link_workspace_margins(
 
     margins = []
     for q_i in q:
-        xy_points = robot_workspace_sample_points(
+        xy_points, xy_radii = robot_workspace_sample_points_and_radii(
             collision_checker,
             q_i,
             min_link_index=1,
         )
-        z_points = robot_workspace_sample_points(
+        z_points, z_radii = robot_workspace_sample_points_and_radii(
             collision_checker,
             q_i,
             min_link_index=2,
         )
-        min_x = float(np.min(xy_points[:, 0]))
-        min_y = float(np.min(xy_points[:, 1]))
-        max_y = float(np.max(xy_points[:, 1]))
-        min_z = float(np.min(z_points[:, 2]))
         margins.append(
             (
-                min_x - collision_checker.robot_sphere_radius - float(x_lower),
-                min_y - collision_checker.robot_sphere_radius - float(y_lower),
-                float(y_upper) - max_y - collision_checker.robot_sphere_radius,
-                min_z - float(z_lower),
+                float(np.min(xy_points[:, 0] - xy_radii)) - float(x_lower),
+                float(np.min(xy_points[:, 1] - xy_radii)) - float(y_lower),
+                float(y_upper) - float(np.max(xy_points[:, 1] + xy_radii)),
+                float(np.min(z_points[:, 2] - z_radii)) - float(z_lower),
             )
         )
     return np.asarray(margins, dtype=float)
 
 
 def robot_workspace_sample_points(collision_checker, q_i, *, min_link_index):
+    points, _radii = robot_workspace_sample_points_and_radii(
+        collision_checker,
+        q_i,
+        min_link_index=min_link_index,
+    )
+    return points
+
+
+def robot_workspace_sample_points_and_radii(collision_checker, q_i, *, min_link_index):
     if not hasattr(collision_checker, "_robot_sample_specs"):
-        return collision_checker._robot_sample_points(q_i)
+        points = collision_checker._robot_sample_points(q_i)
+        radii = np.full(len(points), collision_checker.robot_sphere_radius)
+        return points, radii
 
     collision_checker.plant.SetPositions(
         collision_checker.plant_context,
@@ -230,7 +310,8 @@ def robot_workspace_sample_points(collision_checker, q_i, *, min_link_index):
         q_i,
     )
     points = []
-    for body, offset in collision_checker._robot_sample_specs:
+    radii = []
+    for body, offset, radius in collision_checker._robot_sample_specs:
         body_name = body.name()
         if not robot_body_at_or_after_link(body_name, min_link_index):
             continue
@@ -239,9 +320,12 @@ def robot_workspace_sample_points(collision_checker, q_i, *, min_link_index):
             body,
         )
         points.append(x_wb.multiply(offset))
+        radii.append(float(radius))
     if not points:
-        return collision_checker._robot_sample_points(q_i)
-    return np.asarray(points, dtype=float)
+        points = collision_checker._robot_sample_points(q_i)
+        radii = np.full(len(points), collision_checker.robot_sphere_radius)
+        return points, radii
+    return np.asarray(points, dtype=float), np.asarray(radii, dtype=float)
 
 
 def robot_body_at_or_after_link(body_name, min_link_index):
@@ -305,6 +389,20 @@ def initial_solver_constraint_report(
     path_values = [collision_checker.minimum_distance_constraint_values(q_sampled)]
     path_lbg = [np.zeros_like(path_values[0], dtype=float)]
     path_ubg = [np.ones_like(path_values[0], dtype=float)]
+    self_collision_values = np.array([], dtype=float)
+    if not args.disable_self_collision_constraints:
+        self_collision_values = (
+            collision_checker.robot_self_collision_pair_margins(q_sampled).reshape(-1)
+        )
+        path_values.append(self_collision_values)
+        path_lbg.append(
+            np.full_like(
+                self_collision_values,
+                float(args.self_collision_clearance),
+                dtype=float,
+            )
+        )
+        path_ubg.append(np.full_like(self_collision_values, np.inf, dtype=float))
     if not args.disable_link_y_bounds:
         wall_values = robot_link_workspace_margins(
             collision_checker,
@@ -329,7 +427,8 @@ def initial_solver_constraint_report(
     n_collision = len(q_sampled)
     collision_values = path_values[:n_collision]
     collision_upper = path_ubg[:n_collision]
-    wall_values = path_values[n_collision:]
+    n_self_collision = self_collision_values.size
+    wall_values = path_values[n_collision + n_self_collision :]
 
     max_violation = max(fourier_violation, path_violation)
     return {
@@ -346,6 +445,9 @@ def initial_solver_constraint_report(
         ),
         "drake_collision_margin": min_or_inf(
             np.minimum(collision_values, collision_upper - collision_values)
+        ),
+        "self_collision_margin": min_or_inf(
+            self_collision_values - float(args.self_collision_clearance)
         ),
         "wall_margin": min_or_inf(wall_values),
     }
@@ -369,6 +471,7 @@ def make_collision_checker(
     )
     return drake_camera_collision_checker(
         robot_name=args.robot,
+        robot_urdf_path=args.robot_urdf_path,
         min_distance=args.drake_min_distance,
         robot_sphere_radius=args.drake_robot_sphere_radius,
         robot_link_samples=args.drake_robot_link_samples,
@@ -417,6 +520,7 @@ def generate_valid_initial_trajectory(
                     "Discarding initial candidate "
                     f"{attempt}: max_violation={report['max_violation']}, "
                     f"drake_collision_margin={report['drake_collision_margin']}, "
+                    f"self_collision_margin={report['self_collision_margin']}, "
                     f"wall_margin={report['wall_margin']}"
                 )
             continue
@@ -541,6 +645,7 @@ def main():
     from loguru import logger
     from system_identification.drake.camera_collision import (
         CAMERA_BOX_SPECS_MM,
+        DEFAULT_FR3_SELF_COLLISION_BODY_PAIRS,
         CameraBox,
         DrakeCameraCollisionChecker,
     )
@@ -581,37 +686,59 @@ def main():
             collision_checker,
             base_args,
         )
-        if args.disable_link_y_bounds:
-            return result
-
         validation_stride = max(1, int(args.validation_stride))
         q_sampled = result["q"][::validation_stride]
-        workspace_margins = robot_link_workspace_margins(
-            collision_checker,
-            q_sampled,
-            x_lower=args.link_x_lower,
-            y_lower=args.link_y_lower,
-            y_upper=args.link_y_upper,
-            z_lower=args.link_z_lower,
-        )
-        workspace_margin = float(np.min(workspace_margins))
-        result.update(
-            {
-                "valid": bool(result["valid"] and workspace_margin >= 0.0),
+        workspace_margin = np.inf
+        workspace_report = {}
+        if not args.disable_link_y_bounds:
+            workspace_margins = robot_link_workspace_margins(
+                collision_checker,
+                q_sampled,
+                x_lower=args.link_x_lower,
+                y_lower=args.link_y_lower,
+                y_upper=args.link_y_upper,
+                z_lower=args.link_z_lower,
+            )
+            workspace_margin = float(np.min(workspace_margins))
+            workspace_report = {
                 "link_wall_margin": workspace_margin,
                 "min_x_lower_margin": float(np.min(workspace_margins[:, 0])),
                 "min_y_lower_margin": float(np.min(workspace_margins[:, 1])),
                 "min_y_upper_margin": float(np.min(workspace_margins[:, 2])),
                 "min_z_margin": float(np.min(workspace_margins[:, 3])),
             }
+        self_collision_margin = np.inf
+        if not args.disable_self_collision_constraints:
+            self_collision_margin = float(
+                np.min(
+                    collision_checker.robot_self_collision_pair_margins(q_sampled)
+                    - float(args.self_collision_clearance)
+                )
+            )
+        result.update(
+            {
+                "valid": bool(
+                    result["valid"]
+                    and workspace_margin >= 0.0
+                    and self_collision_margin >= 0.0
+                ),
+                "self_collision_margin": self_collision_margin,
+                **workspace_report,
+            }
         )
-        logger.info(
-            f"{label} sampled workspace margins: "
-            f"x_lower={result['min_x_lower_margin']}; "
-            f"y_lower={result['min_y_lower_margin']}; "
-            f"y_upper={result['min_y_upper_margin']}; "
-            f"z_lower={result['min_z_margin']}"
-        )
+        if not args.disable_link_y_bounds:
+            logger.info(
+                f"{label} sampled workspace margins: "
+                f"x_lower={result['min_x_lower_margin']}; "
+                f"y_lower={result['min_y_lower_margin']}; "
+                f"y_upper={result['min_y_upper_margin']}; "
+                f"z_lower={result['min_z_margin']}"
+            )
+        if not args.disable_self_collision_constraints:
+            logger.info(
+                f"{label} sampled self-collision margin: "
+                f"{result['self_collision_margin']}"
+            )
         return result
 
     if not args.no_save:
@@ -622,6 +749,7 @@ def main():
     np.random.seed(args.seed)
 
     logger.info(f"Using local FR3 helpers and models under {SCRIPT_DIR}")
+    logger.info(f"Using Drake collision URDF: {args.robot_urdf_path}")
     logger.info(
         "FR3 workspace constraints: "
         f"x > {args.link_x_lower}, "
@@ -633,6 +761,18 @@ def main():
         args.camera_box_xy_scale,
         args.camera_box_z_scale,
     )
+    logger.info(
+        "Best-condition Fourier margin tolerances: velocity=%s, position=%s",
+        args.best_condition_fourier_velocity_margin_tolerance,
+        args.best_condition_fourier_position_margin_tolerance,
+    )
+    if not args.disable_self_collision_constraints:
+        logger.info(
+            "FR3 self-collision constraints: %d configured body pairs, "
+            "clearance >= %s",
+            len(DEFAULT_FR3_SELF_COLLISION_BODY_PAIRS),
+            args.self_collision_clearance,
+        )
     logger.info(f"Output directory: {experiment_dir}")
 
     robot_config = retrieve_robot_config(args.robot)
@@ -775,8 +915,17 @@ def main():
         link_y_upper=args.link_y_upper,
         link_z_lower=args.link_z_lower,
         use_link_y_bounds=not args.disable_link_y_bounds,
+        use_self_collision_constraints=not args.disable_self_collision_constraints,
+        self_collision_body_pairs=DEFAULT_FR3_SELF_COLLISION_BODY_PAIRS,
+        self_collision_clearance=args.self_collision_clearance,
         best_condition_initial=args.initial_best_condition_number,
         best_candidate_check_every=args.best_condition_check_every,
+        best_candidate_fourier_velocity_margin_tolerance=(
+            args.best_condition_fourier_velocity_margin_tolerance
+        ),
+        best_candidate_fourier_position_margin_tolerance=(
+            args.best_condition_fourier_position_margin_tolerance
+        ),
         best_candidate_callback=save_best_valid_candidate,
         collision_checker=collision_checker,
     )

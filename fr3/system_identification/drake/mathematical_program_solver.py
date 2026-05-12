@@ -28,8 +28,9 @@ def fourier_constraint_bounds(fourier_config, robot_config):
     if len(upper_pos) > 1:
         lower_pos[1] = -1.0
         upper_pos[1] = 1.0
-    lower_pos *= 0.9
-    upper_pos *= 0.9
+    limit_scale = 0.95
+    lower_pos *= limit_scale
+    upper_pos *= limit_scale
     offset_limit = np.minimum(upper_pos - init_pos, init_pos - lower_pos)
     if np.any(offset_limit <= 0.0):
         raise ValueError(
@@ -46,7 +47,7 @@ def fourier_constraint_bounds(fourier_config, robot_config):
                 0.0,
                 0.0,
                 0.0,
-                float(0.9 * vel_limit[joint_idx]),
+                float(limit_scale * vel_limit[joint_idx]),
                 float(offset_limit[joint_idx] * omega),
             )
         )
@@ -169,6 +170,8 @@ class DrakeMathematicalProgramExcitationSolver:
         best_condition_initial=1.0e7,
         best_candidate_check_every=3,
         best_candidate_callback=None,
+        best_candidate_fourier_velocity_margin_tolerance=0.0,
+        best_candidate_fourier_position_margin_tolerance=0.0,
         finite_difference_step=1e-6,
         collision_checker=None,
     ):
@@ -192,6 +195,14 @@ class DrakeMathematicalProgramExcitationSolver:
         self.best_condition_initial = best_condition_initial
         self.best_candidate_check_every = max(1, int(best_candidate_check_every))
         self.best_candidate_callback = best_candidate_callback
+        self.best_candidate_fourier_velocity_margin_tolerance = max(
+            0.0,
+            float(best_candidate_fourier_velocity_margin_tolerance),
+        )
+        self.best_candidate_fourier_position_margin_tolerance = max(
+            0.0,
+            float(best_candidate_fourier_position_margin_tolerance),
+        )
         self.finite_difference_step = finite_difference_step
         self.collision_checker = collision_checker or DrakeCameraCollisionChecker(
             robot_name=robot_name,
@@ -445,10 +456,48 @@ class DrakeMathematicalProgramExcitationSolver:
             best_candidate_callback_ran = False
             if should_check_best:
                 best_check_failure_reasons = []
-                if max_violation > self.early_stop_constraint_tol:
+                constraint_tol = max(0.0, float(self.early_stop_constraint_tol))
+                fourier_velocity_margin_tol = (
+                    self.best_candidate_fourier_velocity_margin_tolerance
+                )
+                fourier_position_margin_tol = (
+                    self.best_candidate_fourier_position_margin_tolerance
+                )
+                if margin_report["fourier_equality_residual"] > constraint_tol:
                     best_check_failure_reasons.append(
-                        "constraint_violation="
-                        f"{max_violation} > {self.early_stop_constraint_tol}"
+                        "fourier_equality_residual="
+                        f"{margin_report['fourier_equality_residual']} > "
+                        f"{constraint_tol}"
+                    )
+                if (
+                    margin_report["fourier_velocity_margin"]
+                    < -fourier_velocity_margin_tol
+                ):
+                    best_check_failure_reasons.append(
+                        "fourier_velocity_margin="
+                        f"{margin_report['fourier_velocity_margin']} < "
+                        f"{-fourier_velocity_margin_tol}"
+                    )
+                if (
+                    margin_report["fourier_position_margin"]
+                    < -fourier_position_margin_tol
+                ):
+                    best_check_failure_reasons.append(
+                        "fourier_position_margin="
+                        f"{margin_report['fourier_position_margin']} < "
+                        f"{-fourier_position_margin_tol}"
+                    )
+                if margin_report["drake_collision_margin"] < -constraint_tol:
+                    best_check_failure_reasons.append(
+                        "drake_collision_margin="
+                        f"{margin_report['drake_collision_margin']} < "
+                        f"{-constraint_tol}"
+                    )
+                if margin_report["link_y_margin"] < -constraint_tol:
+                    best_check_failure_reasons.append(
+                        "link_y_margin="
+                        f"{margin_report['link_y_margin']} < "
+                        f"{-constraint_tol}"
                     )
                 if not np.isfinite(condition_number):
                     best_check_failure_reasons.append(

@@ -2,6 +2,7 @@ import os
 import xml.etree.ElementTree as ET
 
 from dataclasses import dataclass
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,9 @@ from pydrake.geometry import CollisionFilterDeclaration, GeometrySet
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ROBOT_DESCRIPTION_DIR = PROJECT_ROOT / "robot_description"
+DEFAULT_COLLISION_SPHERES_PATH = (
+    ROBOT_DESCRIPTION_DIR / "fr3_description" / "fr3_collision_spheres.py"
+)
 
 CAMERA_BOX_MARGIN_SCALE = 1.1
 CAMERA_BOX_HEIGHT_SCALE = 1.1
@@ -50,6 +54,40 @@ CAMERA_BOX_SPECS_MM = (
         np.array([870.0, -365.0, 180.0]),
         np.array([180.0, 110.0, 360.0]),
     ),
+)
+DEFAULT_FIXED_COLLISION_JOINTS = ("panda_finger_joint1", "panda_finger_joint2")
+COLLISION_SPHERE_BODY_NAME_ALIASES = {
+    "panda_finger_soft_l": "panda_leftfinger",
+    "panda_finger_soft_r": "panda_rightfinger",
+}
+ROBOT_BODY_NAME_ALIASES = {
+    **COLLISION_SPHERE_BODY_NAME_ALIASES,
+    **{f"fr3_link{idx}": f"panda_link{idx}" for idx in range(8)},
+    "fr3_hand": "panda_hand",
+    "fr3_leftfinger": "panda_leftfinger",
+    "fr3_rightfinger": "panda_rightfinger",
+}
+DEFAULT_FR3_SELF_COLLISION_BODY_PAIRS = (
+    ("fr3_link0", "fr3_link5"),
+    ("fr3_link0", "fr3_link6"),
+    ("fr3_link0", "fr3_link7"),
+    ("fr3_link0", "fr3_hand"),
+    ("fr3_link0", "fr3_leftfinger"),
+    ("fr3_link0", "fr3_rightfinger"),
+    ("fr3_link1", "fr3_link5"),
+    ("fr3_link1", "fr3_link6"),
+    ("fr3_link1", "fr3_link7"),
+    ("fr3_link1", "fr3_hand"),
+    ("fr3_link1", "fr3_leftfinger"),
+    ("fr3_link1", "fr3_rightfinger"),
+    ("fr3_link2", "fr3_link5"),
+    ("fr3_link2", "fr3_link7"),
+    ("fr3_link2", "fr3_hand"),
+    ("fr3_link2", "fr3_leftfinger"),
+    ("fr3_link2", "fr3_rightfinger"),
+    ("fr3_link5", "fr3_hand"),
+    ("fr3_link5", "fr3_leftfinger"),
+    ("fr3_link5", "fr3_rightfinger"),
 )
 
 
@@ -86,8 +124,44 @@ def default_camera_boxes(
     return boxes
 
 
+def _parse_urdf_tolerant(urdf_path):
+    try:
+        return ET.parse(urdf_path)
+    except ET.ParseError as parse_error:
+        lines = Path(urdf_path).read_text(encoding="utf-8").splitlines()
+        cleaned_lines = []
+        previous_nonempty = ""
+        removed_extra_link_close = False
+        for line in lines:
+            stripped = line.strip()
+            if (
+                not removed_extra_link_close
+                and stripped == "</link>"
+                and previous_nonempty == "</joint>"
+            ):
+                removed_extra_link_close = True
+                continue
+            cleaned_lines.append(line)
+            if stripped:
+                previous_nonempty = stripped
+        if not removed_extra_link_close:
+            raise parse_error
+        return ET.ElementTree(ET.fromstring("\n".join(cleaned_lines) + "\n"))
+
+
+def _fix_collision_only_joints(urdf_root, joint_names=DEFAULT_FIXED_COLLISION_JOINTS):
+    joint_names = set(joint_names)
+    for joint in urdf_root.findall("joint"):
+        if joint.attrib.get("name") not in joint_names:
+            continue
+        joint.attrib["type"] = "fixed"
+        for tag in ("axis", "limit", "mimic", "dynamics"):
+            for elem in list(joint.findall(tag)):
+                joint.remove(elem)
+
+
 def _strip_urdf_geometry(urdf_path):
-    tree = ET.parse(urdf_path)
+    tree = _parse_urdf_tolerant(urdf_path)
     root = tree.getroot()
 
     for link in root.findall("link"):
@@ -98,6 +172,8 @@ def _strip_urdf_geometry(urdf_path):
     for joint in root.findall("joint"):
         for elem in list(joint.findall("safety_controller")):
             joint.remove(elem)
+
+    _fix_collision_only_joints(root)
 
     return root, ET.tostring(root, encoding="unicode")
 
@@ -136,6 +212,57 @@ def _geometry_set(geometry_ids):
     return geometry_set
 
 
+def normalize_robot_body_name(body_name):
+    return ROBOT_BODY_NAME_ALIASES.get(body_name, body_name)
+
+
+def normalize_robot_body_pairs(body_pairs):
+    return tuple(
+        (normalize_robot_body_name(first), normalize_robot_body_name(second))
+        for first, second in body_pairs
+    )
+
+
+def _flatten_radius(radius_entry):
+    radius = np.asarray(radius_entry, dtype=float).reshape(-1)
+    if radius.size != 1:
+        raise ValueError(f"Expected one radius value, got {radius_entry}")
+    return float(radius[0])
+
+
+def load_robot_collision_spheres(path=DEFAULT_COLLISION_SPHERES_PATH):
+    path = Path(path).expanduser().resolve()
+    if not path.exists():
+        return {}
+
+    spec = spec_from_file_location("fr3_collision_spheres", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not import collision sphere specs from {path}")
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    spheres = {}
+    for attr_name, positions in vars(module).items():
+        if not attr_name.endswith("_positions"):
+            continue
+        sphere_name = attr_name[: -len("_positions")]
+        radius_name = f"{sphere_name}_radius"
+        if not hasattr(module, radius_name):
+            raise ValueError(f"Missing {radius_name} in {path}")
+        body_name = COLLISION_SPHERE_BODY_NAME_ALIASES.get(sphere_name, sphere_name)
+        radii = getattr(module, radius_name)
+        if len(positions) != len(radii):
+            raise ValueError(
+                f"{sphere_name} has {len(positions)} positions but "
+                f"{len(radii)} radii."
+            )
+        spheres[body_name] = [
+            (np.asarray(position, dtype=float), _flatten_radius(radius))
+            for position, radius in zip(positions, radii)
+        ]
+    return spheres
+
+
 class DrakeCameraCollisionChecker:
     def __init__(
         self,
@@ -149,6 +276,8 @@ class DrakeCameraCollisionChecker:
         xy_prism_height=None,
         camera_box_xy_scale=CAMERA_BOX_MARGIN_SCALE,
         camera_box_z_scale=CAMERA_BOX_HEIGHT_SCALE,
+        robot_collision_sphere_path=DEFAULT_COLLISION_SPHERES_PATH,
+        use_saved_collision_spheres=True,
     ):
         self.robot_name = robot_name
         self.robot_urdf_path = (
@@ -162,6 +291,11 @@ class DrakeCameraCollisionChecker:
             xy_prism_height=xy_prism_height,
             xy_scale=camera_box_xy_scale,
             z_scale=camera_box_z_scale,
+        )
+        self.robot_collision_spheres = (
+            load_robot_collision_spheres(robot_collision_sphere_path)
+            if use_saved_collision_spheres
+            else {}
         )
 
         self._build()
@@ -213,12 +347,34 @@ class DrakeCameraCollisionChecker:
 
     def _register_robot_spheres(self, joint_segments, friction):
         ids = []
-        sphere = Sphere(self.robot_sphere_radius)
         body_names = {
             self.plant.get_body(idx).name()
             for idx in self.plant.GetBodyIndices(self.model_instance)
         }
+        if self.robot_collision_spheres:
+            missing_body_names = sorted(set(self.robot_collision_spheres) - body_names)
+            if missing_body_names:
+                logger.warning(
+                    "Skipping collision sphere specs for missing bodies: %s",
+                    missing_body_names,
+                )
+            for body_name in sorted(set(self.robot_collision_spheres) & body_names):
+                body = self.plant.GetBodyByName(body_name, self.model_instance)
+                for idx, (offset, radius) in enumerate(
+                    self.robot_collision_spheres[body_name]
+                ):
+                    ids.append(
+                        self.plant.RegisterCollisionGeometry(
+                            body,
+                            RigidTransform(offset),
+                            Sphere(radius),
+                            f"{body_name}_saved_sphere_{idx}_collision",
+                            friction,
+                        )
+                    )
+            return ids
 
+        sphere = Sphere(self.robot_sphere_radius)
         for body_name in sorted(body_names):
             body = self.plant.GetBodyByName(body_name, self.model_instance)
             ids.append(
@@ -231,7 +387,7 @@ class DrakeCameraCollisionChecker:
                 )
             )
 
-        for parent_name, _child_name, xyz in joint_segments:
+        for parent_name, child_name, xyz in joint_segments:
             if parent_name == "world" or parent_name not in body_names:
                 continue
             segment_length = np.linalg.norm(xyz)
@@ -246,7 +402,7 @@ class DrakeCameraCollisionChecker:
                         0.5 * xyz,
                     ),
                     Capsule(self.robot_sphere_radius, segment_length),
-                    f"{parent_name}_segment_capsule_collision",
+                    f"{parent_name}_to_{child_name}_segment_capsule_collision",
                     friction,
                 )
             )
@@ -258,10 +414,16 @@ class DrakeCameraCollisionChecker:
             self.plant.get_body(idx).name()
             for idx in self.plant.GetBodyIndices(self.model_instance)
         }
+        if self.robot_collision_spheres:
+            for body_name in sorted(set(self.robot_collision_spheres) & body_names):
+                body = self.plant.GetBodyByName(body_name, self.model_instance)
+                for offset, radius in self.robot_collision_spheres[body_name]:
+                    specs.append((body, offset, radius))
+            return specs
 
         for body_name in sorted(body_names):
             body = self.plant.GetBodyByName(body_name, self.model_instance)
-            specs.append((body, np.zeros(3)))
+            specs.append((body, np.zeros(3), self.robot_sphere_radius))
 
         for parent_name, _child_name, xyz in joint_segments:
             if parent_name == "world" or parent_name not in body_names:
@@ -275,7 +437,7 @@ class DrakeCameraCollisionChecker:
                 self.robot_link_samples,
                 endpoint=True,
             )[1:]:
-                specs.append((parent_body, alpha * xyz))
+                specs.append((parent_body, alpha * xyz, self.robot_sphere_radius))
         return specs
 
     def _register_camera_boxes(self, friction):
@@ -391,13 +553,11 @@ class DrakeCameraCollisionChecker:
 
         margins = []
         for q_i in q:
-            points = self._robot_sample_points(q_i)
-            min_y = float(np.min(points[:, 1]))
-            max_y = float(np.max(points[:, 1]))
+            points, radii = self._robot_sample_points_and_radii(q_i)
             margins.append(
                 (
-                    min_y - self.robot_sphere_radius - float(lower),
-                    float(upper) - max_y - self.robot_sphere_radius,
+                    float(np.min(points[:, 1] - radii)) - float(lower),
+                    float(upper) - float(np.max(points[:, 1] + radii)),
                 )
             )
         return np.asarray(margins, dtype=float)
@@ -409,26 +569,83 @@ class DrakeCameraCollisionChecker:
 
         margins = []
         for q_i in q:
-            points = self._robot_sample_points(q_i)
-            min_y = float(np.min(points[:, 1]))
-            max_y = float(np.max(points[:, 1]))
-            min_z = float(np.min(points[:, 2]))
+            points, radii = self._robot_sample_points_and_radii(q_i)
             margins.append(
                 (
-                    min_y - self.robot_sphere_radius - float(y_lower),
-                    float(y_upper) - max_y - self.robot_sphere_radius,
-                    min_z - float(z_lower),
+                    float(np.min(points[:, 1] - radii)) - float(y_lower),
+                    float(y_upper) - float(np.max(points[:, 1] + radii)),
+                    float(np.min(points[:, 2] - radii)) - float(z_lower),
                 )
             )
         return np.asarray(margins, dtype=float)
 
     def _robot_sample_points(self, q):
+        points, _radii = self._robot_sample_points_and_radii(q)
+        return points
+
+    def _robot_sample_points_and_radii(self, q):
         self.plant.SetPositions(self.plant_context, self.model_instance, q)
         points = []
-        for body, offset in self._robot_sample_specs:
+        radii = []
+        for body, offset, radius in self._robot_sample_specs:
             x_wb = self.plant.EvalBodyPoseInWorld(self.plant_context, body)
             points.append(x_wb.multiply(offset))
-        return np.asarray(points, dtype=float)
+            radii.append(float(radius))
+        return np.asarray(points, dtype=float), np.asarray(radii, dtype=float)
+
+    def _robot_sample_points_by_body(self, q):
+        self.plant.SetPositions(self.plant_context, self.model_instance, q)
+        samples_by_body = {}
+        for body, offset, radius in self._robot_sample_specs:
+            x_wb = self.plant.EvalBodyPoseInWorld(self.plant_context, body)
+            samples_by_body.setdefault(body.name(), []).append(
+                (x_wb.multiply(offset), float(radius))
+            )
+        return samples_by_body
+
+    def robot_self_collision_pair_margins(
+        self,
+        q,
+        body_pairs=DEFAULT_FR3_SELF_COLLISION_BODY_PAIRS,
+    ):
+        q = np.asarray(q, dtype=float)
+        if q.ndim == 1:
+            q = q.reshape(1, -1)
+
+        body_pairs = normalize_robot_body_pairs(body_pairs)
+        margins = []
+        for q_i in q:
+            samples_by_body = self._robot_sample_points_by_body(q_i)
+            q_margins = []
+            for first_body, second_body in body_pairs:
+                first_samples = samples_by_body.get(first_body)
+                second_samples = samples_by_body.get(second_body)
+                if first_samples is None or second_samples is None:
+                    missing = [
+                        body
+                        for body, samples in (
+                            (first_body, first_samples),
+                            (second_body, second_samples),
+                        )
+                        if samples is None
+                    ]
+                    raise ValueError(
+                        "Missing self-collision body samples for "
+                        f"{missing}. Check robot_urdf_path and collision spheres."
+                    )
+
+                pair_margin = np.inf
+                for first_point, first_radius in first_samples:
+                    for second_point, second_radius in second_samples:
+                        margin = (
+                            float(np.linalg.norm(first_point - second_point))
+                            - float(first_radius)
+                            - float(second_radius)
+                        )
+                        pair_margin = min(pair_margin, margin)
+                q_margins.append(pair_margin)
+            margins.append(q_margins)
+        return np.asarray(margins, dtype=float)
 
     def min_clearance(self, q, max_distance=10.0):
         q = np.asarray(q, dtype=float)
