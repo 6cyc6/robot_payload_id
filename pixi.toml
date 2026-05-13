@@ -32,7 +32,9 @@ drake = "==1.36.0"
 drake = "==1.36.0"
 numpy = ">=2.0.0,<3"
 manipulation = ">=2025.2.16,<2026"
-iiwa-setup = { git = "https://github.com/nepfaff/iiwa_setup.git" }
+# iiwa-setup currently fails to install because its upstream Git LFS object for
+# models/planar_pusher.obj is missing. Keep it out of the default environment;
+# the FR3 trajectory tooling under fr3/ does not use it.
 tqdm = ">=4.66.1,<5"
 hydra-core = ">=1.3.2,<2"
 omegaconf = ">=2.3.0,<3"
