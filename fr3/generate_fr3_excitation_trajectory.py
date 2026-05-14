@@ -93,12 +93,12 @@ def parse_args():
         ),
     )
     parser.add_argument("--early_stop_constraint_tol", type=float, default=1e-6)
-    parser.add_argument("--camera_collision_stride", type=int, default=2)
+    parser.add_argument("--camera_collision_stride", type=int, default=3)
     parser.add_argument("--validation_stride", type=int, default=1)
     parser.add_argument("--drake_min_distance", type=float, default=0.02)
     parser.add_argument("--drake_robot_sphere_radius", type=float, default=0.05)
     parser.add_argument("--drake_robot_link_samples", type=int, default=5)
-    parser.add_argument("--drake_camera_chamfer_radius", type=float, default=0.02)
+    parser.add_argument("--drake_camera_chamfer_radius", type=float, default=0.015)
     parser.add_argument(
         "--drake_xy_prism_height",
         type=float,
@@ -127,7 +127,7 @@ def parse_args():
     )
     parser.add_argument("--link_y_lower", type=float, default=-0.4)
     parser.add_argument("--link_y_upper", type=float, default=0.4)
-    parser.add_argument("--link_x_lower", type=float, default=-0.15)
+    parser.add_argument("--link_x_lower", type=float, default=-0.2)
     parser.add_argument("--link_z_lower", type=float, default=0.1)
     parser.add_argument(
         "--disable_self_collision_constraints",
@@ -163,7 +163,7 @@ def make_wall_bound_solver(base_solver_cls, flat_params_to_traj):
         def __init__(
             self,
             *args,
-            link_x_lower=-0.15,
+            link_x_lower=-0.2,
             link_z_lower=0.1,
             use_self_collision_constraints=True,
             self_collision_body_pairs=(),
@@ -222,9 +222,7 @@ def make_wall_bound_solver(base_solver_cls, flat_params_to_traj):
                 else 0
             )
             n_wall_outputs = 4 if self.use_link_y_bounds else 0
-            n_outputs = n_samples * (
-                1 + n_self_collision_outputs + n_wall_outputs
-            )
+            n_outputs = n_samples * (1 + n_self_collision_outputs + n_wall_outputs)
             lower = np.zeros(n_outputs, dtype=float)
             upper = np.full(n_outputs, np.inf, dtype=float)
             upper[:n_samples] = 1.0
@@ -391,9 +389,9 @@ def initial_solver_constraint_report(
     path_ubg = [np.ones_like(path_values[0], dtype=float)]
     self_collision_values = np.array([], dtype=float)
     if not args.disable_self_collision_constraints:
-        self_collision_values = (
-            collision_checker.robot_self_collision_pair_margins(q_sampled).reshape(-1)
-        )
+        self_collision_values = collision_checker.robot_self_collision_pair_margins(
+            q_sampled
+        ).reshape(-1)
         path_values.append(self_collision_values)
         path_lbg.append(
             np.full_like(

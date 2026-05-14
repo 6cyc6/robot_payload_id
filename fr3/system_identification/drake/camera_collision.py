@@ -33,26 +33,33 @@ DEFAULT_COLLISION_SPHERES_PATH = (
 
 CAMERA_BOX_MARGIN_SCALE = 1.1
 CAMERA_BOX_HEIGHT_SCALE = 1.1
+# Raw camera box measurements are stored in millimeters. The collision checker
+# applies CAMERA_BOX_MARGIN_SCALE to x/y size and CAMERA_BOX_HEIGHT_SCALE to z size.
 CAMERA_BOX_SPECS_MM = (
     (
-        "camera_1_pos_y",
-        np.array([165.0, 340.0, 170.0]),
-        np.array([170.0, 160.0, 340.0]),
-    ),
-    (
-        "camera_2_pos_y",
-        np.array([870.0, 365.0, 180.0]),
-        np.array([180.0, 110.0, 360.0]),
-    ),
-    (
         "camera_1_neg_y",
-        np.array([165.0, -340.0, 170.0]),
-        np.array([170.0, 160.0, 340.0]),
+        np.array([145.0, -390.0, 190.0]),
+        np.array([170.0, 200.0, 380.0]),
     ),
     (
         "camera_2_neg_y",
-        np.array([870.0, -365.0, 180.0]),
-        np.array([180.0, 110.0, 360.0]),
+        np.array([860.0, -400.0, 190.0]),
+        np.array([190.0, 200.0, 380.0]),
+    ),
+    (
+        "camera_1_pos_y",
+        np.array([200.0, 390.0, 185.0]),
+        np.array([200.0, 150.0, 370.0]),
+    ),
+    (
+        "camera_2_pos_y",
+        np.array([850.0, 360.0, 185.0]),
+        np.array([230.0, 150.0, 370.0]),
+    ),
+    (
+        "camera_3_pos_y",
+        np.array([1035.0, 125.0, 250.0]),
+        np.array([80.0, 270.0, 500.0]),
     ),
 )
 DEFAULT_FIXED_COLLISION_JOINTS = ("panda_finger_joint1", "panda_finger_joint2")

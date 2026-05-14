@@ -18,8 +18,8 @@ from pydrake.all import (
     DiagramBuilder,
     MeshcatVisualizer,
     Parser,
-    RigidTransform,
     Rgba,
+    RigidTransform,
     SpatialInertia,
     Sphere,
     StartMeshcat,
@@ -252,8 +252,10 @@ def camera_box_specs(xy_prism_height, *, xy_scale, z_scale):
         np.array([0.2, 0.45, 0.9, 0.28]),
         np.array([0.85, 0.2, 0.2, 0.28]),
         np.array([0.2, 0.45, 0.9, 0.28]),
+        np.array([0.2, 0.75, 0.35, 0.28]),
     )
-    for (name, center_mm, size_mm), color in zip(CAMERA_BOX_SPECS_MM, colors):
+    for idx, (name, center_mm, size_mm) in enumerate(CAMERA_BOX_SPECS_MM):
+        color = colors[idx % len(colors)]
         center = center_mm / 1000.0
         size = size_mm.astype(float) / 1000.0
         size[:2] *= float(xy_scale)
@@ -524,12 +526,12 @@ def report_robot_self_collision(
         body_pairs=body_pairs,
     )
     if margins.size == 0:
-        logger.info(
-            "Franka self-collision check skipped: no configured body pairs."
-        )
+        logger.info("Franka self-collision check skipped: no configured body pairs.")
         return np.inf
 
-    local_sample_idx, pair_idx = np.unravel_index(int(np.argmin(margins)), margins.shape)
+    local_sample_idx, pair_idx = np.unravel_index(
+        int(np.argmin(margins)), margins.shape
+    )
     best_margin = float(margins[local_sample_idx, pair_idx])
     best_global_idx = int(sample_indices[local_sample_idx])
     first_body, second_body = normalize_robot_body_pairs(body_pairs)[pair_idx]
@@ -545,9 +547,7 @@ def report_robot_self_collision(
             f"margin {best_margin} < {clearance}."
         )
     else:
-        logger.info(
-            "Trajectory satisfies sampled Franka self-collision sphere check."
-        )
+        logger.info("Trajectory satisfies sampled Franka self-collision sphere check.")
     return best_margin
 
 
@@ -623,11 +623,11 @@ def setup_robot_sample_markers(meshcat, checker, *, marker_radius):
     for idx, (body, _offset, radius) in enumerate(checker._robot_sample_specs):
         body_name = body.name()
         is_gripper = "hand" in body_name or "finger" in body_name
-        color = Rgba(1.0, 0.45, 0.05, 0.95) if is_gripper else Rgba(
-            0.0, 0.55, 1.0, 0.9
-        )
+        color = Rgba(1.0, 0.45, 0.05, 0.95) if is_gripper else Rgba(0.0, 0.55, 1.0, 0.9)
         path = f"/robot_sample_specs/{idx:03d}_{_safe_meshcat_name(body_name)}"
-        display_radius = float(radius) if marker_radius is None else float(marker_radius)
+        display_radius = (
+            float(radius) if marker_radius is None else float(marker_radius)
+        )
         meshcat.SetObject(path, Sphere(max(display_radius, 1e-4)), color)
     logger.info(
         "Visualizing %d robot sample specs in Meshcat: blue=arm, orange=gripper.",
@@ -964,6 +964,7 @@ def main():
         f"Playing trajectory in Meshcat at speed={args.speed}, "
         f"playback_stride={args.playback_stride}"
     )
+
     def play_once():
         play_trajectory(
             diagram,
