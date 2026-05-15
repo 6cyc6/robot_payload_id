@@ -24,7 +24,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Generate a Franka FR3 excitation trajectory with Drake/IPOPT, "
-            "workspace wall constraints, and four camera-box obstacles."
+            "workspace wall constraints, and camera-box obstacles."
         )
     )
     parser.add_argument("--robot", type=str, default="fr3")
@@ -62,6 +62,18 @@ def parse_args():
     )
     parser.add_argument("--objective_lambda", type=float, default=1e-6)
     parser.add_argument("--eig_eps", type=float, default=1e-6)
+    parser.add_argument(
+        "--fourier_velocity_limit_scale",
+        type=float,
+        default=0.9,
+        help="Velocity limit scale used by the IPOPT Fourier constraints.",
+    )
+    parser.add_argument(
+        "--fourier_position_limit_scale",
+        type=float,
+        default=0.92,
+        help="Position limit scale used by the IPOPT Fourier constraints.",
+    )
     parser.add_argument("--ipopt_max_iter", type=int, default=1000)
     parser.add_argument("--ipopt_print_level", type=int, default=5)
     parser.add_argument(
@@ -78,8 +90,8 @@ def parse_args():
         type=float,
         default=0.0,
         help=(
-            "Allow best-condition validation when the 0.95x Fourier velocity "
-            "margin is no smaller than this negative tolerance."
+            "Backward-compatible fallback for the best-condition velocity "
+            "margin gate when no explicit margin minimum is passed to the solver."
         ),
     )
     parser.add_argument(
@@ -87,9 +99,26 @@ def parse_args():
         type=float,
         default=0.0,
         help=(
-            "Allow best-condition validation when the 0.95x Fourier position "
-            "margin is no smaller than this negative tolerance. Collision, "
-            "workspace, and self-collision margins remain hard."
+            "Backward-compatible fallback for the best-condition position "
+            "margin gate when no explicit margin minimum is passed to the solver."
+        ),
+    )
+    parser.add_argument(
+        "--best_condition_fourier_velocity_margin_min",
+        type=float,
+        default=-0.01,
+        help=(
+            "Run the expensive best-candidate validation only when the IPOPT "
+            "Fourier velocity margin is at least this value."
+        ),
+    )
+    parser.add_argument(
+        "--best_condition_fourier_position_margin_min",
+        type=float,
+        default=-0.001,
+        help=(
+            "Run the expensive best-candidate validation only when the IPOPT "
+            "Fourier position margin is at least this value."
         ),
     )
     parser.add_argument("--early_stop_constraint_tol", type=float, default=1e-6)
@@ -591,6 +620,24 @@ def save_traj_csv(save_dir, name, t, q, dq, ddq):
     return csv_path
 
 
+def condition_number_filename_suffix(condition_number):
+    condition_number = float(condition_number)
+    if not np.isfinite(condition_number):
+        return "nonfinite"
+    text = f"{condition_number:.6g}"
+    return text.replace("-", "neg").replace("+", "").replace(".", "p")
+
+
+def unique_csv_stem(save_dir, stem):
+    save_dir = Path(save_dir)
+    candidate = stem
+    counter = 2
+    while (save_dir / f"{candidate}.csv").exists():
+        candidate = f"{stem}_{counter}"
+        counter += 1
+    return candidate
+
+
 def save_robot_payload_fourier_format(
     save_dir,
     flat_params,
@@ -665,6 +712,14 @@ def main():
     from system_identification.inertia_model import InertiaModel
     from system_identification.ipopt_solver import evaluate_params_metrics
     from system_identification.utils import retrieve_robot_config, vis_compare_seqs
+
+    def optimization_fourier_constraint_bounds(fourier_config, robot_config):
+        return fourier_constraint_bounds(
+            fourier_config,
+            robot_config,
+            velocity_limit_scale=args.fourier_velocity_limit_scale,
+            position_limit_scale=args.fourier_position_limit_scale,
+        )
 
     def validate_trajectory(
         label,
@@ -760,9 +815,15 @@ def main():
         args.camera_box_z_scale,
     )
     logger.info(
-        "Best-condition Fourier margin tolerances: velocity=%s, position=%s",
-        args.best_condition_fourier_velocity_margin_tolerance,
-        args.best_condition_fourier_position_margin_tolerance,
+        "IPOPT Fourier constraint scales: velocity=%s, position=%s; "
+        "validation remains at 0.95x",
+        args.fourier_velocity_limit_scale,
+        args.fourier_position_limit_scale,
+    )
+    logger.info(
+        "Best-condition validation margin thresholds: velocity>=%s, position>=%s",
+        args.best_condition_fourier_velocity_margin_min,
+        args.best_condition_fourier_position_margin_min,
     )
     if not args.disable_self_collision_constraints:
         logger.info(
@@ -796,7 +857,7 @@ def main():
         is_traj_valid,
         obtain_fourier_traj,
         validate_trajectory,
-        fourier_constraint_bounds,
+        optimization_fourier_constraint_bounds,
         fourier_constraint_values,
     )
     if not args.no_save:
@@ -872,6 +933,21 @@ def main():
         )
         best_callback_record["record"] = record
         if not args.no_save:
+            condition_suffix = condition_number_filename_suffix(
+                metrics["condition_number"]
+            )
+            archive_name = unique_csv_stem(
+                experiment_dir,
+                f"best_condition_{condition_suffix}",
+            )
+            save_traj_csv(
+                experiment_dir,
+                archive_name,
+                eval_result["t"],
+                eval_result["q"],
+                eval_result["dq"],
+                eval_result["ddq"],
+            )
             save_traj_csv(
                 experiment_dir,
                 "best_condition",
@@ -880,6 +956,7 @@ def main():
                 eval_result["dq"],
                 eval_result["ddq"],
             )
+            logger.info(f"Saved valid best-condition archive: {archive_name}.csv")
         logger.info(
             f"Accepted valid best candidate at IPOPT iteration {iteration}: "
             f"condition_number={metrics['condition_number']}"
@@ -924,6 +1001,14 @@ def main():
         best_candidate_fourier_position_margin_tolerance=(
             args.best_condition_fourier_position_margin_tolerance
         ),
+        best_candidate_fourier_velocity_margin_min=(
+            args.best_condition_fourier_velocity_margin_min
+        ),
+        best_candidate_fourier_position_margin_min=(
+            args.best_condition_fourier_position_margin_min
+        ),
+        fourier_velocity_limit_scale=args.fourier_velocity_limit_scale,
+        fourier_position_limit_scale=args.fourier_position_limit_scale,
         best_candidate_callback=save_best_valid_candidate,
         collision_checker=collision_checker,
     )

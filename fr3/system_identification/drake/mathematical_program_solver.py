@@ -12,7 +12,13 @@ from system_identification.ipopt_solver import (
 )
 
 
-def fourier_constraint_bounds(fourier_config, robot_config):
+def fourier_constraint_bounds(
+    fourier_config,
+    robot_config,
+    *,
+    velocity_limit_scale=0.95,
+    position_limit_scale=0.95,
+):
     order = fourier_config["order"]
     duration = fourier_config["duration"]
     njoints = robot_config["njoints"]
@@ -28,9 +34,10 @@ def fourier_constraint_bounds(fourier_config, robot_config):
     if len(upper_pos) > 1:
         lower_pos[1] = -1.0
         upper_pos[1] = 1.0
-    limit_scale = 0.95
-    lower_pos *= limit_scale
-    upper_pos *= limit_scale
+    velocity_limit_scale = float(velocity_limit_scale)
+    position_limit_scale = float(position_limit_scale)
+    lower_pos *= position_limit_scale
+    upper_pos *= position_limit_scale
     offset_limit = np.minimum(upper_pos - init_pos, init_pos - lower_pos)
     if np.any(offset_limit <= 0.0):
         raise ValueError(
@@ -47,7 +54,7 @@ def fourier_constraint_bounds(fourier_config, robot_config):
                 0.0,
                 0.0,
                 0.0,
-                float(limit_scale * vel_limit[joint_idx]),
+                float(velocity_limit_scale * vel_limit[joint_idx]),
                 float(offset_limit[joint_idx] * omega),
             )
         )
@@ -172,6 +179,10 @@ class DrakeMathematicalProgramExcitationSolver:
         best_candidate_callback=None,
         best_candidate_fourier_velocity_margin_tolerance=0.0,
         best_candidate_fourier_position_margin_tolerance=0.0,
+        best_candidate_fourier_velocity_margin_min=None,
+        best_candidate_fourier_position_margin_min=None,
+        fourier_velocity_limit_scale=0.95,
+        fourier_position_limit_scale=0.95,
         finite_difference_step=1e-6,
         collision_checker=None,
     ):
@@ -195,14 +206,24 @@ class DrakeMathematicalProgramExcitationSolver:
         self.best_condition_initial = best_condition_initial
         self.best_candidate_check_every = max(1, int(best_candidate_check_every))
         self.best_candidate_callback = best_candidate_callback
-        self.best_candidate_fourier_velocity_margin_tolerance = max(
-            0.0,
-            float(best_candidate_fourier_velocity_margin_tolerance),
+        if best_candidate_fourier_velocity_margin_min is None:
+            best_candidate_fourier_velocity_margin_min = -max(
+                0.0,
+                float(best_candidate_fourier_velocity_margin_tolerance),
+            )
+        if best_candidate_fourier_position_margin_min is None:
+            best_candidate_fourier_position_margin_min = -max(
+                0.0,
+                float(best_candidate_fourier_position_margin_tolerance),
+            )
+        self.best_candidate_fourier_velocity_margin_min = float(
+            best_candidate_fourier_velocity_margin_min
         )
-        self.best_candidate_fourier_position_margin_tolerance = max(
-            0.0,
-            float(best_candidate_fourier_position_margin_tolerance),
+        self.best_candidate_fourier_position_margin_min = float(
+            best_candidate_fourier_position_margin_min
         )
+        self.fourier_velocity_limit_scale = float(fourier_velocity_limit_scale)
+        self.fourier_position_limit_scale = float(fourier_position_limit_scale)
         self.finite_difference_step = finite_difference_step
         self.collision_checker = collision_checker or DrakeCameraCollisionChecker(
             robot_name=robot_name,
@@ -386,6 +407,8 @@ class DrakeMathematicalProgramExcitationSolver:
         fourier_lbg, fourier_ubg = fourier_constraint_bounds(
             self.fourier_config,
             self.robot_config,
+            velocity_limit_scale=self.fourier_velocity_limit_scale,
+            position_limit_scale=self.fourier_position_limit_scale,
         )
         prog.AddConstraint(
             self._fourier_constraint_callback,
@@ -457,12 +480,6 @@ class DrakeMathematicalProgramExcitationSolver:
             if should_check_best:
                 best_check_failure_reasons = []
                 constraint_tol = max(0.0, float(self.early_stop_constraint_tol))
-                fourier_velocity_margin_tol = (
-                    self.best_candidate_fourier_velocity_margin_tolerance
-                )
-                fourier_position_margin_tol = (
-                    self.best_candidate_fourier_position_margin_tolerance
-                )
                 if margin_report["fourier_equality_residual"] > constraint_tol:
                     best_check_failure_reasons.append(
                         "fourier_equality_residual="
@@ -471,21 +488,21 @@ class DrakeMathematicalProgramExcitationSolver:
                     )
                 if (
                     margin_report["fourier_velocity_margin"]
-                    < -fourier_velocity_margin_tol
+                    < self.best_candidate_fourier_velocity_margin_min
                 ):
                     best_check_failure_reasons.append(
                         "fourier_velocity_margin="
                         f"{margin_report['fourier_velocity_margin']} < "
-                        f"{-fourier_velocity_margin_tol}"
+                        f"{self.best_candidate_fourier_velocity_margin_min}"
                     )
                 if (
                     margin_report["fourier_position_margin"]
-                    < -fourier_position_margin_tol
+                    < self.best_candidate_fourier_position_margin_min
                 ):
                     best_check_failure_reasons.append(
                         "fourier_position_margin="
                         f"{margin_report['fourier_position_margin']} < "
-                        f"{-fourier_position_margin_tol}"
+                        f"{self.best_candidate_fourier_position_margin_min}"
                     )
                 if margin_report["drake_collision_margin"] < -constraint_tol:
                     best_check_failure_reasons.append(

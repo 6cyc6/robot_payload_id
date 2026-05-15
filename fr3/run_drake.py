@@ -764,7 +764,7 @@ def main():
         default=CAMERA_BOX_HEIGHT_SCALE,
         help="Scale applied to camera obstacle z dimension.",
     )
-    parser.add_argument("--link_x_lower", type=float, default=-0.15)
+    parser.add_argument("--link_x_lower", type=float, default=-0.2)
     parser.add_argument("--link_y_lower", type=float, default=-0.4)
     parser.add_argument("--link_y_upper", type=float, default=0.4)
     parser.add_argument("--link_z_lower", type=float, default=0.1)
