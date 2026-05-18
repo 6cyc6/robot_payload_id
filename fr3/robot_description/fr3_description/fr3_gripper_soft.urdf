@@ -268,85 +268,42 @@
   <!-- Define the hand_tcp frame -->
   <link name="panda_hand_tcp" />
   <joint name="panda_hand_tcp_joint" type="fixed">
-    <origin rpy="0 0 0" xyz="0 0 0.2104" />
+    <origin rpy="0 0 0" xyz="0 0 0.1034" />
     <parent link="panda_hand" />
     <child link="panda_hand_tcp" />
   </joint>
-  <!-- Link finger left -->
+  <!-- Link finger -->
   <link name="panda_leftfinger">
   	<inertial>
       <origin rpy="0 0 0" xyz="0 0.0 0.0"/>
-       <mass value="0.2"/>
+       <mass value="0.015"/>
        <inertia ixx="2.3749999999999997e-06" ixy="0" ixz="0" iyy="2.3749999999999997e-06" iyz="0" izz="7.5e-07"/>
     </inertial>
-    <!-- screw mount -->
-    <collision>
-      <origin rpy="0 0 0" xyz="0 18.5e-3 11e-3"/>
-      <geometry>
-        <box size="22e-3 15e-3 20e-3"/>
-      </geometry>
-    </collision>
-    <!-- cartriage sledge -->
-    <collision>
-      <origin rpy="0 0 0" xyz="0 6.8e-3 2.2e-3"/>
-      <geometry>
-        <box size="22e-3 8.8e-3 3.8e-3"/>
-      </geometry>
-    </collision>
-    <!-- gripper holder -->
     <collision>
       <geometry>
-        <mesh filename="meshes/collision/gripper_holder_l.stl"/>
-      </geometry>
-    </collision>
-    <!-- gripper -->
-    <collision>
-      <geometry>
-        <mesh filename="meshes/collision/gripper_solid_l.stl"/>
+        <mesh filename="meshes/collision/finger_soft_l.stl"/>
       </geometry>
     </collision>
     <visual>
       <geometry>
-        <mesh filename="meshes/visual/gripper_hard_l.dae"/>
+        <mesh filename="meshes/visual/finger_soft_l.dae"/>
       </geometry>
     </visual>
   </link>
-  <!-- Link finger right -->
   <link name="panda_rightfinger">
   	<inertial>
       <origin rpy="0 0 0" xyz="0 0.0 0.0"/>
-       <mass value="0.2"/>
+       <mass value="0.015"/>
        <inertia ixx="2.3749999999999997e-06" ixy="0" ixz="0" iyy="2.3749999999999997e-06" iyz="0" izz="7.5e-07"/>
     </inertial>
-    <!-- screw mount -->
-    <collision>
-      <origin rpy="0 0 0" xyz="0 18.5e-3 11e-3"/>
-      <geometry>
-        <box size="22e-3 15e-3 20e-3"/>
-      </geometry>
-    </collision>
-    <!-- cartriage sledge -->
-    <collision>
-      <origin rpy="0 0 0" xyz="0 6.8e-3 2.2e-3"/>
-      <geometry>
-        <box size="22e-3 8.8e-3 3.8e-3"/>
-      </geometry>
-    </collision>
-    <!-- gripper holder -->
     <collision>
       <geometry>
-        <mesh filename="meshes/collision/gripper_holder_r.stl"/>
-      </geometry>
-    </collision>
-    <!-- gripper -->
-    <collision>
-      <geometry>
-        <mesh filename="meshes/collision/gripper_solid_r.stl"/>
+        <mesh filename="meshes/collision/finger_soft_r.stl"/>
       </geometry>
     </collision>
     <visual>
       <geometry>
-        <mesh filename="meshes/visual/gripper_hard_r.dae"/>
+        <mesh filename="meshes/visual/finger_soft_r.dae"/>
       </geometry>
     </visual>
   </link>
@@ -356,17 +313,15 @@
     <child link="panda_leftfinger"/>
     <origin rpy="0 0 0" xyz="0 0 0.0584"/>
     <axis xyz="0 1 0"/>
-    <limit effort="100" lower="0.0" upper="0.04" velocity="0.2"/>
-    <dynamics damping="0.3"/>
+    <limit effort="20" lower="0.0" upper="0.04" velocity="0.2"/>
   </joint>
   <joint name="panda_finger_joint2" type="prismatic">
     <parent link="panda_hand"/>
     <child link="panda_rightfinger"/>
     <origin rpy="0 0 0" xyz="0 0 0.0584"/>
     <axis xyz="0 -1 0"/>
-    <limit effort="100" lower="0.0" upper="0.04" velocity="0.2"/>
+    <limit effort="20" lower="0.0" upper="0.04" velocity="0.2"/>
     <mimic joint="panda_finger_joint1"/>
-    <dynamics damping="0.3"/>
   </joint>
   </link>
 
